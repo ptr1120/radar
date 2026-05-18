@@ -180,6 +180,254 @@ func (s *Server) handleGitOpsInsights(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, insight)
 }
 
+// managedScanKinds is the set of K8s kinds /api/gitops/managed-resources
+// iterates when discovering resources tagged with Argo's tracking
+// annotation/label.
+//
+// Scope: controller-level kinds Argo CD typically declares directly in
+// manifests (Deployments, Services, ConfigMaps, RBAC, …). Pods and
+// ReplicaSets are deliberately excluded — they're created by their owning
+// workload (Deployment → ReplicaSet → Pod) and don't carry Argo's
+// tracking annotation. Including them would scan thousands of cache
+// entries per request without adding signal.
+//
+// Subtree expansion (showing the Pods owned by a matched Deployment) is
+// a future enhancement that would walk the topology graph rather than the
+// flat annotation index — keep that out of the hot per-request scan.
+//
+// CRDs managed by Argo Apps aren't iterated here. Real-world need would
+// drive adding e.g. cert-manager Certificates, KEDA ScaledObjects, etc.
+type managedScanKind struct {
+	Kind  string
+	Group string
+}
+
+// managedScanDenyList is the set of Kinds we skip when scanning for
+// resources with Argo's tracking annotation. Two reasons a Kind belongs
+// here:
+//
+//  1. Descendants of Argo-managed resources that are owned, not declared.
+//     Argo never stamps the tracking annotation on Pods/ReplicaSets/etc.
+//     — those are walked from the matched owners by the tree builder
+//     (see pkg/gitops/tree.expandSubtree). Including them in the scan
+//     produces double-counting + a slower scan.
+//
+//  2. Platform-internal noise that's never user-managed:
+//     Events (ephemeral), Leases (controller heartbeats), Endpoints /
+//     EndpointSlice (Service shadow), FlowSchema / PriorityLevelConfiguration
+//     (API priority internals), {Local,Self,}SubjectAccessReview /
+//     TokenRequest / TokenReview (subject-action stubs, not stored).
+//
+// NOT a security boundary — the per-node RBAC filter (filterGitOpsTreeForUser)
+// is what gates what each caller sees. This list just keeps the scan
+// focused on Kinds Argo realistically manages.
+var managedScanDenyList = map[string]bool{
+	"Pod":                        true,
+	"ReplicaSet":                 true,
+	"ControllerRevision":         true,
+	"Endpoints":                  true,
+	"EndpointSlice":              true,
+	"Event":                      true,
+	"Lease":                      true,
+	"FlowSchema":                 true,
+	"PriorityLevelConfiguration": true,
+	"TokenRequest":               true,
+	"TokenReview":                true,
+	"SubjectAccessReview":        true,
+	"SelfSubjectAccessReview":    true,
+	"LocalSubjectAccessReview":   true,
+	"SelfSubjectRulesReview":     true,
+	"Binding":                    true,
+}
+
+// managedScanKindsFromDiscovery builds the kind list for the managed-
+// resources scan by asking radar's existing APIResources discovery what
+// the cluster actually has. Filters out:
+//
+//   - kinds in managedScanDenyList (see above)
+//   - kinds whose verbs don't include `list` (we can't scan them anyway)
+//
+// Returns the full list — CRDs included. This is the architectural lever
+// that makes the managed-resources endpoint complete: cert-manager
+// Certificates, Argo Rollouts, Gateway API HTTPRoutes, KEDA ScaledObjects,
+// operator CRs — all show up in the tree without anyone editing this file.
+//
+// Empty discovery (boot-time race or a degraded cluster) returns nil;
+// caller surfaces it as "discovery unavailable" rather than silently
+// scanning nothing.
+func managedScanKindsFromDiscovery() []managedScanKind {
+	disc := k8s.GetResourceDiscovery()
+	if disc == nil {
+		return nil
+	}
+	resources, err := disc.GetAPIResources()
+	if err != nil || len(resources) == 0 {
+		return nil
+	}
+	out := make([]managedScanKind, 0, len(resources))
+	for _, r := range resources {
+		if managedScanDenyList[r.Kind] {
+			continue
+		}
+		hasList := false
+		for _, v := range r.Verbs {
+			if v == "list" {
+				hasList = true
+				break
+			}
+		}
+		if !hasList {
+			continue
+		}
+		out = append(out, managedScanKind{Kind: r.Kind, Group: r.Group})
+	}
+	return out
+}
+
+// handleGitOpsManagedResources discovers resources in THIS cluster that are
+// managed by the named Argo Application, returning them as a synthetic
+// ResourceTree the SPA can render with the existing GitOpsTreeGraph
+// component.
+//
+// The endpoint is the destination-side companion to /api/gitops/tree —
+// the latter is controller-side (walks live ownership from the Application
+// CRD outward, only works when controller + workloads share a cluster);
+// this one is destination-side (matches by Argo's tracking annotation,
+// works regardless of where the controller lives). Used by Radar Hub's
+// fleet GitOps detail page to render the workload graph for cross-cluster
+// Argo apps; also useful for single-cluster Radar users connected to a
+// destination cluster who want to see "what's managed here by app X".
+//
+// Query params:
+//   - app       (required): Argo Application name. Resources are matched
+//               when annotation argocd.argoproj.io/tracking-id starts with
+//               "<app>:" OR label app.kubernetes.io/instance=<app>.
+//   - namespace (optional): restrict the synthetic root's display ns +
+//               filter matched resources to this namespace.
+func (s *Server) handleGitOpsManagedResources(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConnected(w) {
+		return
+	}
+	app := strings.TrimSpace(r.URL.Query().Get("app"))
+	if app == "" {
+		s.writeError(w, http.StatusBadRequest, "app query parameter is required")
+		return
+	}
+	nsFilter := strings.TrimSpace(r.URL.Query().Get("namespace"))
+
+	allowedNamespaces := s.getUserNamespaces(r, nil)
+	if noNamespaceAccess(allowedNamespaces) {
+		// Caller has no namespace access — return a tree with just the
+		// synthetic root + a warning. Mirrors handleGitOpsTree's behavior
+		// rather than 403'ing so the SPA can render an honest empty state.
+		empty := gitopstree.BuildManagedTree(app, nsFilter, nil)
+		empty.Warnings = []string{"You do not have access to any namespace; managed resources are filtered out."}
+		s.writeJSON(w, empty)
+		return
+	}
+
+	cache := k8s.GetResourceCache()
+	if cache == nil {
+		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
+		return
+	}
+
+	// Discover what Kinds the cluster actually has — CRDs included —
+	// instead of relying on a static list. Customers using cert-manager,
+	// Argo Rollouts, Gateway API, KEDA, External Secrets, etc. all get
+	// their resources in the tree without any code change here. The
+	// scan deny-list keeps the list focused (drops descendants like
+	// Pod/ReplicaSet that are walked from owners separately, and
+	// platform-internal noise like Events/Leases).
+	scanKinds := managedScanKindsFromDiscovery()
+	if len(scanKinds) == 0 {
+		// Discovery is unavailable (boot-time race or degraded cluster).
+		// Surface to caller rather than scanning nothing silently.
+		empty := gitopstree.BuildManagedTree(app, nsFilter, nil)
+		empty.Warnings = []string{"API resource discovery is not available yet — managed resources can't be enumerated until discovery completes."}
+		s.writeJSON(w, empty)
+		return
+	}
+
+	matched := make([]*unstructured.Unstructured, 0, 32)
+	// kindErrors accumulates per-kind list failures so a kind-class
+	// blackout (informer-sync stuck post-restart, cluster-wide RBAC
+	// denial) is visible to the caller as a warning rather than
+	// indistinguishable from "this app legitimately manages 0
+	// resources." A single-kind failure (CRD not installed, narrow
+	// RBAC) is expected and the scan continues; if every kind fails,
+	// the warning surfaces in the response so the SPA can render an
+	// inline note.
+	var kindErrors []string
+	for _, mk := range scanKinds {
+		// Empty namespace = list across all namespaces from the cache.
+		// We rely on filterGitOpsTreeForUser below for per-resource RBAC
+		// (matching the contract handleGitOpsTree uses) — including the
+		// per-kind canRead check for cluster-scoped resources that the
+		// previous inline namespace-only filter was missing.
+		objs, err := cache.ListDynamicWithGroup(r.Context(), mk.Kind, "", mk.Group)
+		if err != nil {
+			kindErrors = append(kindErrors, mk.Kind+": "+err.Error())
+			continue
+		}
+		for _, obj := range objs {
+			ns := obj.GetNamespace()
+			// `ns == ""` means cluster-scoped; let it pass nsFilter so apps that manage
+			// ClusterRole/ClusterRoleBinding/Namespace alongside namespaced workloads
+			// still show those resources. filterGitOpsTreeForUser enforces per-kind canRead.
+			if nsFilter != "" && ns != "" && ns != nsFilter {
+				continue
+			}
+			if !gitopstree.ArgoTrackingMatches(obj, app) {
+				continue
+			}
+			matched = append(matched, obj)
+		}
+	}
+
+	tree := gitopstree.BuildManagedTree(app, nsFilter, matched)
+	if len(kindErrors) > 0 {
+		// Log when more than a couple of kinds failed — single-kind
+		// errors (one CRD missing) are noise; a widespread blackout is
+		// a real operator signal. ≥3 means "the informer cache or RBAC
+		// is broken across most kinds," not "this cluster is missing
+		// some optional CRDs."
+		if len(kindErrors) >= 3 {
+			// Sanitize each kind-error string before logging — k8s API
+			// errors echo CRD names + resource fields that, while not
+			// directly user-controlled, could carry CR/LF and forge
+			// log lines on aggregators.
+			safeErrors := make([]string, len(kindErrors))
+			for i, e := range kindErrors {
+				safeErrors[i] = sanitizeForLog(e)
+			}
+			log.Printf("[gitops] managed-resources: %d/%d kinds failed to list for app=%s: %v",
+				len(kindErrors), len(scanKinds), sanitizeForLog(app), safeErrors)
+		}
+		tree.Warnings = append(tree.Warnings,
+			fmt.Sprintf("Some resource kinds couldn't be scanned (%d of %d failed); the list may be incomplete.",
+				len(kindErrors), len(scanKinds)))
+	}
+
+	// Apply the existing per-resource RBAC filter — same gate
+	// handleGitOpsTree uses for its tree, so cross-cluster discovery
+	// can't expose more than the controller-side endpoint already would.
+	// Critically, this calls canRead for cluster-scoped Kinds (e.g.
+	// ClusterRole), closing the gap where the previous namespace-only
+	// gate let any authenticated namespace user see cluster-scoped
+	// Argo-managed resources.
+	req := &gitopsRequest{
+		Kind:              "applications",
+		Namespace:         nsFilter,
+		Name:              app,
+		Group:             "argoproj.io",
+		Cache:             cache,
+		AllowedNamespaces: allowedNamespaces,
+	}
+	tree = s.filterGitOpsTreeForUser(r, req, tree)
+	s.writeJSON(w, tree)
+}
+
 func (s *Server) filterGitOpsTreeForUser(r *http.Request, req *gitopsRequest, tree *gitopstree.ResourceTree) *gitopstree.ResourceTree {
 	if tree == nil || auth.UserFromContext(r.Context()) == nil {
 		return tree

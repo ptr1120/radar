@@ -1,26 +1,42 @@
 import { useState, useEffect, type ComponentType } from 'react'
-import { DialogPortal } from '@skyhook-io/k8s-ui'
 import { Loader2, RefreshCw } from 'lucide-react'
 
-interface SyncOptionsDialogProps {
+import { DialogPortal } from '../ui/DialogPortal'
+
+// =============================================================================
+// SyncOptionsDialog — Argo CD Sync drawer, shared between per-cluster
+// Radar (OSS web/) and Radar Hub's fleet GitOps detail page. Presentational
+// only: caller controls open state, supplies the app label, and handles
+// the onConfirm callback (POST to /api/argo/applications/{ns}/{name}/sync
+// or the hub-proxied equivalent /c/{ctrl}/api/argo/...).
+//
+// Defaults match Argo's most-common path (prune true, no dry-run, no
+// force) so the two-click sync stays cheap. Revision is optional — empty
+// falls through to the Application's targetRevision.
+// =============================================================================
+
+// ArgoSyncOpts is the payload shape the dialog passes to its onConfirm
+// callback (and that downstream POSTs to `/api/argo/applications/{ns}/{name}/sync`
+// expect). Exported separately so consumers can type the mutationFn arg
+// without redeclaring the structure — keeps OSS and Hub in lockstep on
+// the wire shape.
+export interface ArgoSyncOpts {
+  revision?: string
+  prune: boolean
+  dryRun: boolean
+  force: boolean
+  applyOnly: boolean
+  syncOptions: string[]
+}
+
+export interface SyncOptionsDialogProps {
   open: boolean
   appLabel: string
   pending?: boolean
   onCancel: () => void
-  onConfirm: (opts: {
-    revision?: string
-    prune: boolean
-    dryRun: boolean
-    force: boolean
-    applyOnly: boolean
-    syncOptions: string[]
-  }) => void
+  onConfirm: (opts: ArgoSyncOpts) => void
 }
 
-// Modeled on ArgoCD's Sync drawer. Single Sync-now button at the bottom;
-// defaults are "what most users want" (prune true, no dry-run, no force)
-// so the common path is two clicks. Revision is optional and falls
-// through to whatever Argo had targeted before.
 export function SyncOptionsDialog({ open, appLabel, pending, onCancel, onConfirm }: SyncOptionsDialogProps) {
   const [revision, setRevision] = useState('')
   const [prune, setPrune] = useState(true)
