@@ -2,6 +2,8 @@ package k8s
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -67,7 +69,7 @@ func scopeOf(r *PermissionCheckResult, k string) k8score.ResourceScope {
 func TestProbeResourceAccess_ClusterWideUser(t *testing.T) {
 	dyn := fakeDyn(t, func(_ schema.GroupVersionResource, _ string) bool { return true })
 
-	result, hadErrors := probeResourceAccess(context.Background(), dyn, "", false)
+	result, hadErrors := probeResourceAccess(context.Background(), dyn, nil, false)
 
 	if hadErrors {
 		t.Fatalf("hadErrors should be false on a clean run")
@@ -99,7 +101,7 @@ func TestProbeResourceAccess_NamespaceOnlyUser(t *testing.T) {
 		return namespace == ns
 	})
 
-	result, _ := probeResourceAccess(context.Background(), dyn, ns, false)
+	result, _ := probeResourceAccess(context.Background(), dyn, []string{ns}, false)
 
 	if !result.NamespaceScoped {
 		t.Fatalf("NamespaceScoped should be true when namespaced fallback succeeded")
@@ -126,6 +128,148 @@ func TestProbeResourceAccess_NamespaceOnlyUser(t *testing.T) {
 	}
 }
 
+func TestPickPrimaryNs(t *testing.T) {
+	scope := func(ns string) k8score.ResourceScope {
+		return k8score.ResourceScope{Enabled: true, Namespace: ns}
+	}
+	disabled := k8score.ResourceScope{}
+
+	cases := []struct {
+		name       string
+		candidates []string
+		scopes     map[string]k8score.ResourceScope
+		want       string
+	}{
+		{
+			name:       "no grants falls back to first candidate",
+			candidates: []string{"default", "team-a"},
+			scopes:     map[string]k8score.ResourceScope{k8score.Pods: disabled},
+			want:       "default",
+		},
+		{
+			name:       "first candidate granted",
+			candidates: []string{"default", "team-a"},
+			scopes:     map[string]k8score.ResourceScope{k8score.Pods: scope("default")},
+			want:       "default",
+		},
+		{
+			name:       "later candidate granted, primary follows the actual grant",
+			candidates: []string{"default", "team-a"},
+			scopes:     map[string]k8score.ResourceScope{k8score.Secrets: scope("team-a")},
+			want:       "team-a",
+		},
+		{
+			name:       "grants in multiple candidates, earliest in priority wins",
+			candidates: []string{"default", "team-a", "team-b"},
+			scopes: map[string]k8score.ResourceScope{
+				k8score.Secrets:    scope("team-b"),
+				k8score.ConfigMaps: scope("team-a"),
+			},
+			want: "team-a",
+		},
+		{
+			name:       "no candidates returns empty",
+			candidates: nil,
+			scopes:     map[string]k8score.ResourceScope{k8score.Pods: scope("team-a")},
+			want:       "",
+		},
+		{
+			name:       "cluster-wide grant ignored (empty ns doesn't count as a grant location)",
+			candidates: []string{"default"},
+			scopes:     map[string]k8score.ResourceScope{k8score.Pods: scope("")},
+			want:       "default",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pickPrimaryNs(tc.candidates, tc.scopes); got != tc.want {
+				t.Errorf("pickPrimaryNs(%v, …) = %q, want %q", tc.candidates, got, tc.want)
+			}
+		})
+	}
+}
+
+// genNamespaces produces N distinct namespace names — used to drive
+// mergeScopeCandidates past the cap, which a live-client test can't do
+// without a fake clientset.
+func genNamespaces(prefix string, count int) []string {
+	out := make([]string, count)
+	for i := range out {
+		out[i] = fmt.Sprintf("%s-%03d", prefix, i)
+	}
+	return out
+}
+
+func TestMergeScopeCandidates_NonAuthoritativeIgnoresAccessible(t *testing.T) {
+	out, dropped := mergeScopeCandidates("dev", "prod", []string{"alpha", "beta"}, false)
+	want := []string{"dev", "prod"}
+	if !reflect.DeepEqual(out, want) {
+		t.Errorf("out = %v, want %v (accessible must be ignored when non-authoritative)", out, want)
+	}
+	if dropped != 0 {
+		t.Errorf("dropped = %d, want 0 (no truncation reported on non-authoritative path)", dropped)
+	}
+}
+
+// Regression: the previous implementation `break`-ed out of the accessible
+// loop on atCap, so dropped never reached the log threshold and operators
+// got no truncation breadcrumb in the very case the log was added for.
+func TestMergeScopeCandidates_CountsAllDrops(t *testing.T) {
+	// 25 accessible namespaces, no overlap with context/flag — pure cap test.
+	out, dropped := mergeScopeCandidates("", "", genNamespaces("ns", 25), true)
+	if len(out) != maxScopeCandidates {
+		t.Errorf("len(out) = %d, want %d", len(out), maxScopeCandidates)
+	}
+	if dropped != 5 {
+		t.Errorf("dropped = %d, want 5 (25 accessible - 20 cap)", dropped)
+	}
+}
+
+// Drops must still count when context+flag occupy the first slots — the
+// case the second-round review flagged where the original predicate
+// missed truncation.
+func TestMergeScopeCandidates_CountsDropsWithContextAndFlag(t *testing.T) {
+	out, dropped := mergeScopeCandidates("dev", "prod", genNamespaces("ns", 25), true)
+	if len(out) != maxScopeCandidates {
+		t.Errorf("len(out) = %d, want %d", len(out), maxScopeCandidates)
+	}
+	if out[0] != "dev" || out[1] != "prod" {
+		t.Errorf("out[0..1] = %v, want [dev prod]", out[:2])
+	}
+	// 25 accessible, 18 of them fit (after dev+prod take 2 slots), 7 drop.
+	if dropped != 7 {
+		t.Errorf("dropped = %d, want 7 (25 accessible - 18 remaining cap slots)", dropped)
+	}
+}
+
+// A user with secret-list permission in a namespace that isn't the
+// kubeconfig context namespace should still get the Secret informer wired
+// — the probe must walk every candidate, not just the first one.
+func TestProbeResourceAccess_FallbackCandidatesBeyondFirst(t *testing.T) {
+	const accessibleNs = "team-a"
+	dyn := fakeDyn(t, func(gvr schema.GroupVersionResource, namespace string) bool {
+		// User has secret-list in team-a only — nothing cluster-wide, nothing
+		// in `default` (which would be the kubeconfig fallback).
+		return gvr.Group == "" && gvr.Resource == "secrets" && namespace == accessibleNs
+	})
+
+	// `default` is first in the candidate list (typical kubeconfig context),
+	// team-a follows. Pre-fix the probe stopped at `default` and disabled
+	// Secrets — now it walks to team-a.
+	result, _ := probeResourceAccess(context.Background(), dyn, []string{"default", accessibleNs}, false)
+
+	if got := scopeOf(result, k8score.Secrets); got != (k8score.ResourceScope{Enabled: true, Namespace: accessibleNs}) {
+		t.Errorf("Secrets scope = %+v, want enabled+%q (fallback must walk past first candidate)", got, accessibleNs)
+	}
+	// result.Namespace must follow the actual grant — otherwise the dynamic
+	// CRD cache (which reads it as NamespaceFallback) would pin CRD informers
+	// to `default` where the user has nothing.
+	if result.Namespace != accessibleNs {
+		t.Errorf("result.Namespace = %q, want %q so CRD informer fallback lands where the user has reads", result.Namespace, accessibleNs)
+	}
+}
+
 // TestProbeResourceAccess_MixedScope verifies that each kind is probed
 // independently: a kind with cluster-wide read access (e.g. Events) must
 // not suppress the namespace-scoped retry for other kinds in the same run.
@@ -141,7 +285,7 @@ func TestProbeResourceAccess_MixedScope(t *testing.T) {
 		return namespace == ns
 	})
 
-	result, _ := probeResourceAccess(context.Background(), dyn, ns, false)
+	result, _ := probeResourceAccess(context.Background(), dyn, []string{ns}, false)
 
 	if !result.NamespaceScoped {
 		t.Fatalf("NamespaceScoped should be true (some kinds ended up ns-scoped)")
@@ -166,7 +310,7 @@ func TestProbeResourceAccess_AllDenied(t *testing.T) {
 	dyn := fakeDyn(t, func(_ schema.GroupVersionResource, _ string) bool { return false })
 
 	// No fallback namespace — nothing can succeed.
-	result, _ := probeResourceAccess(context.Background(), dyn, "", false)
+	result, _ := probeResourceAccess(context.Background(), dyn, nil, false)
 
 	if result.NamespaceScoped {
 		t.Errorf("NamespaceScoped should be false when nothing succeeded")
@@ -198,7 +342,7 @@ func TestProbeResourceAccess_TransientErrorTreatedAsAllow(t *testing.T) {
 		return true, nil, transient
 	})
 
-	result, hadErrors := probeResourceAccess(context.Background(), dyn, "", false)
+	result, hadErrors := probeResourceAccess(context.Background(), dyn, nil, false)
 
 	if !hadErrors {
 		t.Errorf("hadErrors should be true when a probe hit a transient error")
@@ -224,7 +368,7 @@ func TestProbeResourceAccess_ForceNamespaceClusterWideUser(t *testing.T) {
 	// pin namespaced kinds to ns and keep cluster-only kinds cluster-wide.
 	dyn := fakeDyn(t, func(_ schema.GroupVersionResource, _ string) bool { return true })
 
-	result, _ := probeResourceAccess(context.Background(), dyn, ns, true)
+	result, _ := probeResourceAccess(context.Background(), dyn, []string{ns}, true)
 
 	if !result.NamespaceScoped {
 		t.Fatalf("NamespaceScoped should be true in forced-namespace mode")
@@ -259,7 +403,7 @@ func TestProbeResourceAccess_ForceNamespaceClusterOnlyMixed(t *testing.T) {
 		return true
 	})
 
-	result, _ := probeResourceAccess(context.Background(), dyn, ns, true)
+	result, _ := probeResourceAccess(context.Background(), dyn, []string{ns}, true)
 
 	if scopeOf(result, k8score.Nodes).Enabled {
 		t.Errorf("Nodes should be disabled when cluster-wide Node list is forbidden")
@@ -279,7 +423,7 @@ func TestProbeResourceAccess_ForceNamespaceAllDeniedKeepsScoped(t *testing.T) {
 	const ns = "dev-ns-1"
 	dyn := fakeDyn(t, func(_ schema.GroupVersionResource, _ string) bool { return false })
 
-	result, _ := probeResourceAccess(context.Background(), dyn, ns, true)
+	result, _ := probeResourceAccess(context.Background(), dyn, []string{ns}, true)
 
 	if !result.NamespaceScoped {
 		t.Errorf("NamespaceScoped should remain true under forceNamespace even when every probe failed")
@@ -317,7 +461,7 @@ func TestProbeResourceAccess_ClusterOnlyKindsNoNsFallback(t *testing.T) {
 		return namespace == ns
 	})
 
-	_, _ = probeResourceAccess(context.Background(), dyn, ns, false)
+	_, _ = probeResourceAccess(context.Background(), dyn, []string{ns}, false)
 
 	if len(nsProbedClusterOnly) > 0 {
 		t.Errorf("cluster-scoped kinds were probed namespace-scoped (would 404 in real cluster): %v", nsProbedClusterOnly)
