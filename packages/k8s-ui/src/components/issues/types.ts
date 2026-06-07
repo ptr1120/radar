@@ -85,6 +85,24 @@ export interface IssueChangeContext {
   evidence?: string;
 }
 
+export interface IssueRecentChangeField {
+  path: string;
+  oldValue?: unknown;
+  newValue?: unknown;
+}
+
+export interface IssueRecentChange {
+  kind: string;
+  namespace?: string;
+  name: string;
+  changeType: string;
+  summary?: string;
+  timestamp: string;
+  change_category?: 'spec_config' | 'lifecycle' | 'runtime_status' | string;
+  rank_reason?: string;
+  fields?: IssueRecentChangeField[];
+}
+
 /**
  * A grouped live issue — one row of the triage queue. Subject (kind/group/
  * namespace/name) is the topmost owner when the rows folded under a workload,
@@ -135,6 +153,19 @@ export interface Issue {
   // Pod crash context carried from the representative member.
   restart_count?: number;
   last_terminated_reason?: string;
+
+  /**
+   * Best-effort timing evidence from K8s-native signals. Absent when Radar has
+   * no confident signal. This is not a root-cause verdict.
+   *
+   * "started_at_resource_creation"        — failing state began during resource
+   *                                        creation or first reconciliation.
+   * "started_after_resource_was_healthy"  — a meaningful healthy window preceded
+   *                                        the failing state.
+   */
+  issue_timing?: 'started_at_resource_creation' | 'started_after_resource_was_healthy';
+  /** The evidence that determined issue_timing (for auditability). */
+  issue_timing_basis?: 'condition' | 'owner_condition' | 'pod_creation' | 'deletion' | 'phase' | 'spec';
 }
 
 /** subjectRef builds a deep-linkable ref for an issue's subject — the row's

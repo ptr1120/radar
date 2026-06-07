@@ -2373,6 +2373,9 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request) {
 		IncludeManaged:   includeManaged,
 		IncludeK8sEvents: includeK8sEvents,
 		FilterPreset:     filterPreset,
+		// The persistent store retains events from previously-connected
+		// clusters; the timeline view answers for the current one only.
+		ClusterContext: k8s.ActiveClusterContext(),
 	}
 	if kind != "" {
 		opts.Kinds = []string{kind}
@@ -2428,7 +2431,7 @@ func (s *Server) handleChangeChildren(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	children, err := store.GetChangesForOwner(r.Context(), ownerKind, namespace, ownerName, since, 100)
+	children, err := store.GetChangesForOwner(r.Context(), ownerKind, namespace, ownerName, k8s.ActiveClusterContext(), since, 100)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return

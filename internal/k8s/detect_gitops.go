@@ -221,6 +221,10 @@ func detectFluxProblems(items []*unstructured.Unstructured, kind, group string, 
 		p := gitopsProblem(kind, group, obj.GetNamespace(), obj.GetName(), "critical", displayReason, msg, age)
 		p.DurationSeconds = int64(d.Seconds())
 		p.Duration = FormatAge(d)
+		if since > 0 {
+			timingR := IssueTimingFromConditionLTT(now.Add(-since), obj.GetCreationTimestamp().Time, "condition")
+			p.IssueTiming, p.IssueTimingBasis = timingR.IssueTiming, timingR.Basis
+		}
 		out = append(out, p)
 	}
 	return out

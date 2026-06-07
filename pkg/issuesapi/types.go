@@ -214,6 +214,24 @@ type ChangeContext struct {
 	Evidence string `json:"evidence,omitempty"`
 }
 
+type ChangeField struct {
+	Path     string `json:"path"`
+	OldValue any    `json:"oldValue,omitempty"`
+	NewValue any    `json:"newValue,omitempty"`
+}
+
+type RecentChange struct {
+	Kind           string        `json:"kind"`
+	Namespace      string        `json:"namespace,omitempty"`
+	Name           string        `json:"name"`
+	ChangeType     string        `json:"changeType"`
+	Summary        string        `json:"summary,omitempty"`
+	Timestamp      string        `json:"timestamp"`
+	ChangeCategory string        `json:"change_category,omitempty"`
+	RankReason     string        `json:"rank_reason,omitempty"`
+	Fields         []ChangeField `json:"fields,omitempty"`
+}
+
 type ClusterContext struct {
 	DNS *ClusterDNSContext `json:"dns,omitempty"`
 }
@@ -259,17 +277,49 @@ type Issue struct {
 	MembersTruncated     bool               `json:"members_truncated,omitempty"`
 	DiagnosticContext    *DiagnosticContext `json:"diagnostic_context,omitempty"`
 	ChangeContext        *ChangeContext     `json:"change_context,omitempty"`
+	// IssueTiming is best-effort timing evidence for when this issue entered
+	// the failing state, derived from K8s-native signals (condition
+	// lastTransitionTime, resource phase, deletion timestamp) at detection
+	// time. Absent when the signal is ambiguous — treat absence as "unknown",
+	// not "started_at_resource_creation" or "started_after_resource_was_healthy".
+	//
+	// "started_at_resource_creation"        — evidence places the failing state
+	//                                        during resource creation or first
+	//                                        reconciliation.
+	// "started_after_resource_was_healthy"  — evidence shows a meaningful
+	//                                        healthy window before the failing
+	//                                        condition appeared.
+	//
+	// This is timing evidence, not a root-cause verdict. A bad rollout or bad
+	// config change can legitimately fail at resource creation.
+	IssueTiming string `json:"issue_timing,omitempty"`
+	// IssueTimingBasis documents the evidence used to derive IssueTiming so the
+	// classification is auditable, not magic.
+	//   "condition"       — condition.lastTransitionTime on the resource itself
+	//   "owner_condition" — condition on the parent workload (e.g. Deployment.Available);
+	//                       reflects workload-level health timing, not cause-specific timing
+	//                       (a new image error on an already-degraded Deployment inherits
+	//                       the Deployment's timing, not the image error's timing)
+	//   "pod_creation"    — pod and Deployment creation timestamps compared; used for
+	//                       crashloop pods on young Deployments where the Available
+	//                       condition races with CrashLoopBackOff's brief ready windows
+	//   "deletion"        — deletionTimestamp (always appeared after creation)
+	//   "phase"           — resource Phase field (e.g. PVC Pending)
+	//   "spec"            — structural spec invariant (no timestamp required)
+	IssueTimingBasis string `json:"issue_timing_basis,omitempty"`
 }
 
 type Response struct {
-	Issues            []Issue         `json:"issues"`
-	Total             int             `json:"total"`
-	TotalMatched      int             `json:"total_matched"`
-	FilterErrors      int             `json:"filter_errors,omitempty"`
-	FilterErrorSample string          `json:"filter_error_sample,omitempty"`
-	Visibility        any             `json:"visibility,omitempty"`
-	NarrowHint        string          `json:"narrowHint,omitempty"`
-	ClusterContext    *ClusterContext `json:"cluster_context,omitempty"`
+	Issues              []Issue         `json:"issues"`
+	Total               int             `json:"total"`
+	TotalMatched        int             `json:"total_matched"`
+	FilterErrors        int             `json:"filter_errors,omitempty"`
+	FilterErrorSample   string          `json:"filter_error_sample,omitempty"`
+	Visibility          any             `json:"visibility,omitempty"`
+	NarrowHint          string          `json:"narrowHint,omitempty"`
+	ClusterContext      *ClusterContext `json:"cluster_context,omitempty"`
+	RecentChanges       []RecentChange  `json:"recent_changes,omitempty"`
+	RecentChangesReason string          `json:"recent_changes_reason,omitempty"`
 }
 
 type BindingType string
@@ -301,4 +351,10 @@ var CELBindings = []CELBinding{
 	{Name: "grouping_scope", Type: BindingString},
 	{Name: "restart_count", Type: BindingInt},
 	{Name: "last_terminated_reason", Type: BindingString},
+	// issue_timing / issue_timing_basis: filter to issues with specific timing evidence.
+	// issue_timing == "started_at_resource_creation"        — failing state began during creation/first reconciliation.
+	// issue_timing == "started_after_resource_was_healthy"  — a meaningful healthy window preceded the failing state.
+	// issue_timing == ""                                    — no confident timing signal.
+	{Name: "issue_timing", Type: BindingString},
+	{Name: "issue_timing_basis", Type: BindingString},
 }

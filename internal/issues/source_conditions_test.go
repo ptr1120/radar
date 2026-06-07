@@ -30,7 +30,7 @@ func TestArgoRolloutFailure(t *testing.T) {
 		{"type": "Progressing", "status": "False", "reason": "ProgressDeadlineExceeded", "message": "deadline"},
 		{"type": "InvalidSpec", "status": "True", "reason": "InvalidSpec", "message": "bad stableService"},
 	})
-	if r, m, ok := argoRolloutFailure(ro); !ok || r != "InvalidSpec" || m != "bad stableService" {
+	if r, m, _, ok := argoRolloutFailure(ro); !ok || r != "InvalidSpec" || m != "bad stableService" {
 		t.Errorf("InvalidSpec must win: got (%q,%q,%v)", r, m, ok)
 	}
 
@@ -39,7 +39,7 @@ func TestArgoRolloutFailure(t *testing.T) {
 		{"type": "Healthy", "status": "False", "reason": "RolloutHealthy"},
 		{"type": "Progressing", "status": "False", "reason": "ProgressDeadlineExceeded", "message": "timed out"},
 	})
-	if r, _, ok := argoRolloutFailure(stalled); !ok || r != "Progressing: ProgressDeadlineExceeded" {
+	if r, _, _, ok := argoRolloutFailure(stalled); !ok || r != "Progressing: ProgressDeadlineExceeded" {
 		t.Errorf("ProgressDeadlineExceeded fallback: got (%q,%v)", r, ok)
 	}
 
@@ -49,8 +49,87 @@ func TestArgoRolloutFailure(t *testing.T) {
 		{"type": "Healthy", "status": "False", "reason": "RolloutHealthy"},
 		{"type": "Progressing", "status": "True", "reason": "ReplicaSetUpdated"},
 	})
-	if _, _, ok := argoRolloutFailure(progressing); ok {
+	if _, _, _, ok := argoRolloutFailure(progressing); ok {
 		t.Error("a mid-progress rollout must not be flagged as a definitive failure")
+	}
+
+	// The override condition's lastTransitionTime drives first_seen and issue_timing —
+	// a valid LTT must round-trip into the returned since.
+	withLTT := rolloutWithConditions([]map[string]any{
+		{"type": "Healthy", "status": "False", "reason": "RolloutHealthy"},
+		{"type": "InvalidSpec", "status": "True", "reason": "InvalidSpec", "message": "bad", "lastTransitionTime": time.Now().Add(-5 * time.Minute).Format(time.RFC3339)},
+	})
+	if _, _, since, ok := argoRolloutFailure(withLTT); !ok || since < 4*time.Minute || since > 6*time.Minute {
+		t.Errorf("valid LTT must produce since ≈ 5m, got (%v, %v)", since, ok)
+	}
+
+	// Malformed or missing LTT → since=0, which downstream means "omit issue_timing"
+	// rather than falling back to a wrong timestamp.
+	badLTT := rolloutWithConditions([]map[string]any{
+		{"type": "InvalidSpec", "status": "True", "reason": "InvalidSpec", "lastTransitionTime": "not-a-timestamp"},
+	})
+	if _, _, since, ok := argoRolloutFailure(badLTT); !ok || since != 0 {
+		t.Errorf("malformed LTT must produce since=0, got (%v, %v)", since, ok)
+	}
+}
+
+// TestNewConditionIssue_IssueTimingSinceGuard pins the since=0 guard: a condition
+// with no lastTransitionTime must not produce an issue_timing. Without the guard,
+// lastSeen=now makes failingFor≈0 and any old resource looks like it was
+// "healthy for ages then broke" — a false runtime classification.
+func TestNewConditionIssue_IssueTimingSinceGuard(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: "example.io", Version: "v1", Resource: "widgets"}
+	createdAt := time.Now().Add(-2 * time.Hour)
+
+	noLTT := newConditionIssue(gvr, "Widget", "ns", "w", SeverityWarning, "Ready: Bad", "msg", 0, "fp", createdAt)
+	if noLTT.IssueTiming != "" || noLTT.IssueTimingBasis != "" {
+		t.Errorf("since=0 must omit issue_timing, got (%q, %q)", noLTT.IssueTiming, noLTT.IssueTimingBasis)
+	}
+
+	withLTT := newConditionIssue(gvr, "Widget", "ns", "w", SeverityWarning, "Ready: Bad", "msg", 30*time.Minute, "fp", createdAt)
+	if withLTT.IssueTiming != "started_after_resource_was_healthy" || withLTT.IssueTimingBasis != "condition" {
+		t.Errorf("90m healthy then failing 30m must be started_after_resource_was_healthy/condition, got (%q, %q)", withLTT.IssueTiming, withLTT.IssueTimingBasis)
+	}
+}
+
+// A Rollout override (InvalidSpec) without a parseable LTT must omit
+// issue_timing but KEEP the generic Healthy condition's age anchor for
+// FirstSeen — resetting it to compose-time would make a long-broken rollout
+// look newly broken and jump the queue on every poll.
+func TestDetectGenericCRDIssues_RolloutOverrideWithoutLTTKeepsAnchor(t *testing.T) {
+	rolloutGVR := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "rollouts"}
+	healthyLTT := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	p := &fakeProvider{
+		dynamic: map[schema.GroupVersionResource][]*unstructured.Unstructured{
+			rolloutGVR: {{
+				Object: map[string]any{
+					"metadata": map[string]any{"name": "checkout", "namespace": "prod"},
+					"status": map[string]any{
+						"conditions": []any{
+							map[string]any{"type": "Healthy", "status": "False", "reason": "RolloutHealthy", "lastTransitionTime": healthyLTT},
+							map[string]any{"type": "InvalidSpec", "status": "True", "reason": "InvalidSpec", "message": "bad stableService"},
+						},
+					},
+				},
+			}},
+		},
+		kinds:      map[schema.GroupVersionResource]string{rolloutGVR: "Rollout"},
+		namespaced: map[schema.GroupVersionResource]bool{rolloutGVR: true},
+	}
+
+	got := Compose(p, Filters{})
+	if len(got) != 1 {
+		t.Fatalf("Compose() issues = %d, want 1: %+v", len(got), got)
+	}
+	iss := got[0]
+	if iss.Reason != "InvalidSpec" || iss.Severity != SeverityCritical {
+		t.Errorf("override must still win: reason=%q severity=%q", iss.Reason, iss.Severity)
+	}
+	if iss.IssueTiming != "" || iss.IssueTimingBasis != "" {
+		t.Errorf("no override LTT → issue_timing must be omitted, got (%q, %q)", iss.IssueTiming, iss.IssueTimingBasis)
+	}
+	if age := time.Since(iss.FirstSeen); age < 90*time.Minute {
+		t.Errorf("FirstSeen must keep the Healthy condition's 2h anchor, got %v ago", age)
 	}
 }
 

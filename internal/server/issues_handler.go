@@ -9,6 +9,7 @@ import (
 	"github.com/skyhook-io/radar/internal/filter"
 	"github.com/skyhook-io/radar/internal/issues"
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/internal/meaningfulchanges"
 )
 
 // handleIssues serves GET /api/issues — "what's broken right now."
@@ -98,6 +99,19 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 	resp.ClusterContext = provider.ClusterContextForIssues(namespaces, func(group, resource string) bool {
 		return s.canRead(r, group, resource, "kube-system", "list")
 	})
+	if len(namespaces) == 1 && stats.TotalMatched == len(out) && meaningfulchanges.IssueChangesQueryEligible(q.Get("kind"), q.Get("filter"), q.Get("severity")) {
+		if recentChangesReason := meaningfulchanges.IssueChangesReason(out); recentChangesReason != "" {
+			if changes, _, err := meaningfulchanges.Recent(r.Context(), meaningfulchanges.Query{
+				Namespaces: []string{namespaces[0]},
+				Since:      meaningfulchanges.DefaultSince,
+				Limit:      meaningfulchanges.IssueChangesLimit,
+				FieldLimit: meaningfulchanges.DefaultFieldLimit,
+			}); err == nil && len(changes) > 0 {
+				resp.RecentChanges = changes
+				resp.RecentChangesReason = recentChangesReason
+			}
+		}
+	}
 	if result := k8s.GetCachedPermissionResult(); result != nil {
 		if visibility := k8s.BuildVisibilitySummary(result, k8s.VisibilityNamespace(namespaces)); visibility != nil {
 			resp.Visibility = visibility

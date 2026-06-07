@@ -21,11 +21,13 @@ import (
 	"github.com/skyhook-io/radar/internal/helm"
 	"github.com/skyhook-io/radar/internal/issues"
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/internal/meaningfulchanges"
 	"github.com/skyhook-io/radar/internal/resourcecontextrefs"
 	"github.com/skyhook-io/radar/internal/search"
 	"github.com/skyhook-io/radar/internal/summarycontext"
 	"github.com/skyhook-io/radar/internal/timeline"
 	aicontext "github.com/skyhook-io/radar/pkg/ai/context"
+	"github.com/skyhook-io/radar/pkg/issuesapi"
 	"github.com/skyhook-io/radar/pkg/k8score"
 	"github.com/skyhook-io/radar/pkg/resourcecontext"
 	topology "github.com/skyhook-io/radar/pkg/topology"
@@ -167,6 +169,8 @@ func registerTools(server *mcp.Server) {
 			"resourceContext (managedBy, exposes, selectedBy, uses, runsOn, " +
 			"issue/audit/policy rollups) + current AND previous container logs across the " +
 			"workload's pods + recent Warning events filtered to this resource + a " +
+			"recentChanges section for the workload and directly referenced " +
+			"ConfigMaps (no Secret content) + a " +
 			"startupBlockers section when the workload can't reach Running (unschedulable " +
 			"with the offending node constraint named, admission/quota rejection, or a " +
 			"post-bind CNI/volume stall). Use for " +
@@ -190,12 +194,13 @@ func registerTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "get_changes",
 		Description: "Use when the symptom is 'this worked earlier' or 'something broke " +
-			"after a deploy/config change.' Returns a chronological feed of resource " +
-			"creates, updates, and deletes such as image changes, ConfigMap edits, scale " +
-			"events, label edits, and rollout churn. This is often faster than reading " +
-			"ReplicaSet histories or individual audit/log streams. Pair with since to " +
-			"bound the window; filter by namespace, kind, or name when you know the scope. " +
-			"Omit namespace when the relevant change may be outside the app namespace.",
+			"after a deploy/config change.' Returns recent meaningful changes ranked with " +
+			"spec/config changes first, including field-level diffs for Deployment env/probes " +
+			"and structured ConfigMap data when available. This is often faster than reading " +
+			"ReplicaSet histories or individual audit/log streams, especially when issues " +
+			"are empty or dominated by baseline failures. Pair with since to bound the window; " +
+			"filter by namespace, kind, or name when you know the scope. Omit namespace when " +
+			"the relevant change may be outside the app namespace.",
 		Annotations: readOnly,
 	}, logToolCall("get_changes", handleGetChanges))
 
@@ -248,14 +253,17 @@ func registerTools(server *mcp.Server) {
 	// (Argo Applications + Flux HelmReleases/Kustomizations) into a
 	// unified "what's installed in this cluster" view with source
 	// provenance. Each row's `sources` field shows which detection
-	// channels voted "this is installed" — H, L, C, A, F.
+	// channels voted "this is installed" — H, L, C, A, F — and the
+	// MCP response includes sourceLegend so those terse stable codes
+	// are interpretable without external docs.
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "list_packages",
 		Description: "List installed packages (Helm releases, label-managed workloads, CRDs, " +
 			"Argo Applications, Flux HelmReleases + Kustomizations) with their sources, " +
 			"versions, and health. Each row carries a `sources` array (H=Helm API, " +
 			"L=workload labels, C=CRD registrations, A=Argo declaration, F=Flux declaration) " +
-			"so the caller can see WHY this package is detected, plus a `contributors` " +
+			"so the caller can see WHY this package is detected; the MCP response also includes " +
+			"`sourceLegend` mapping those stable codes to readable meanings, plus a `contributors` " +
 			"array with per-source detail (each source's view of health/version, plus the " +
 			"GitOps controller resource identity in declarationName/declarationNamespace " +
 			"for sources A and F). Aggregated row-level health is worst-of contributors; " +
@@ -292,6 +300,11 @@ func registerTools(server *mcp.Server) {
 			"rows include `diagnostic_context`: deterministic facts such as explicit " +
 			"missing refs, selected backend issues, or workload rollups; treat these as " +
 			"triage context, not proof of root cause. " +
+			"When `recent_changes` is present, consider it if the issue list does not " +
+			"explain the reported symptom; `recent_changes_reason` says why Radar " +
+			"attached it. It lists recent spec/config changes that may explain failures " +
+			"not yet visible as runtime issues, or help distinguish creation-time " +
+			"baseline failures from the active incident. " +
 			"For raw Kubernetes Warning events use get_events; for static best-practice / " +
 			"security-posture findings (runAsRoot, missing PDB, no probes, missing resource " +
 			"limits) use get_cluster_audit — a separate axis that must never be conflated (a " +
@@ -460,7 +473,7 @@ type getResourceInput struct {
 	Group     string `json:"group,omitempty" jsonschema:"API group when the kind is ambiguous (e.g. cluster.x-k8s.io for CAPI Cluster vs CNPG Cluster)"`
 	Namespace string `json:"namespace,omitempty" jsonschema:"namespace for namespaced kinds. Leave empty for cluster-scoped kinds (Node, ClusterRole, ClusterRoleBinding, IngressClass, PriorityClass, StorageClass, etc.)."`
 	Name      string `json:"name" jsonschema:"resource name"`
-	Include   string `json:"include,omitempty" jsonschema:"optional sidecar data after narrowing to this object: events, metrics. Separate from context. For logs use get_pod_logs / get_workload_logs (container, previous, since, grep) or diagnose for the full workload bundle."`
+	Include   string `json:"include,omitempty" jsonschema:"optional supplemental data after narrowing to this object: events, metrics, changes. include=changes follows the existing comma-separated include pattern. Separate from context. For logs use get_pod_logs / get_workload_logs (container, previous, since, grep) or diagnose for the full workload bundle."`
 	Context   string `json:"context,omitempty" jsonschema:"resourceContext tier: 'basic' (default; attaches managedBy / exposes / selectedBy / uses / runsOn / issueSummary / auditSummary rollups) or 'none' (bare minified resource). For full diagnostic tier with logs + events bundled, use the diagnose tool instead."`
 }
 
@@ -508,7 +521,7 @@ type issuesInput struct {
 	Severity  string `json:"severity,omitempty" jsonschema:"comma-separated: critical,warning"`
 	Kind      string `json:"kind,omitempty" jsonschema:"comma-separated kind filter (e.g. Deployment,Pod)"`
 	Limit     int    `json:"limit,omitempty" jsonschema:"max issues returned (default 200, max 1000)"`
-	Filter    string `json:"filter,omitempty" jsonschema:"optional CEL boolean expression run against each composed Issue. Bindings: severity (critical|warning), category (e.g. crashloop, image_pull_failed, missing_config_ref, gitops_sync_failed), category_group (startup|runtime|scheduling|configuration|networking|storage|scaling|security|control_plane), source (problem|missing_ref|scheduling|condition), kind, group, ns (the namespace — use 'ns', not 'namespace' which is a CEL reserved word), name, reason, message, count (int, the affected-resource fan-out), grouping_scope (workload|service|node|…), restart_count (int), last_terminated_reason, first_seen + last_seen (unix seconds — prefer first_seen for onset/age; last_seen churns to compose-time). For cross-cluster scoping use clusters= (not a CEL predicate). Examples: 'severity == \"critical\" && count > 5', 'category_group == \"startup\"', 'restart_count > 10', 'first_seen < timestamp(\"2026-05-01T00:00:00Z\").getSeconds()'"`
+	Filter    string `json:"filter,omitempty" jsonschema:"optional CEL boolean expression run against each composed Issue. Bindings: severity (critical|warning), category (e.g. crashloop, image_pull_failed, missing_config_ref, gitops_sync_failed), category_group (startup|runtime|scheduling|configuration|networking|storage|scaling|security|control_plane; runtime here is an issue taxonomy group, not issue_timing), source (problem=built-in Radar detector, missing_ref=dangling by-name reference, scheduling=pod startup blocker, condition=False controller/CRD condition), kind, group, ns (the namespace — use 'ns', not 'namespace' which is a CEL reserved word), name, reason, message, count (int, the affected-resource fan-out), grouping_scope (workload|service|node|…), restart_count (int), last_terminated_reason, first_seen + last_seen (unix seconds; last_seen churns to compose-time), issue_timing (string timing evidence: 'started_at_resource_creation' = evidence places the failing state during resource creation or first reconciliation; 'started_after_resource_was_healthy' = evidence shows a meaningful healthy window before the failing condition appeared; absent = Radar has no clean signal, do NOT infer timing from age alone; this is timing evidence, not a root-cause verdict), issue_timing_basis (string: evidence used — 'condition' | 'owner_condition' | 'pod_creation' | 'deletion' | 'phase' | 'spec'). For cross-cluster scoping use clusters= (not a CEL predicate). Examples: 'severity == \"critical\" && count > 5', 'category_group == \"startup\"', 'restart_count > 10', 'issue_timing == \"started_after_resource_was_healthy\"', 'issue_timing == \"started_at_resource_creation\"'"`
 }
 
 // Tool handlers
@@ -888,7 +901,7 @@ func handleGetResource(ctx context.Context, req *mcp.CallToolRequest, input getR
 		}
 	}
 
-	// Build the resourceContext sidecar unless the caller opted out. Basic
+	// Build the resourceContext section unless the caller opted out. Basic
 	// tier is the default: cheap managedBy / exposes / selectedBy /
 	// runsOn / uses / issueSummary / auditSummary / policySummary. Pass
 	// context=none for a bare minified resource (bulk scans, raw jq work).
@@ -908,11 +921,24 @@ func handleGetResource(ctx context.Context, req *mcp.CallToolRequest, input getR
 		warnings = k8score.EnrichRuntimeObjectWarnings(rawObj)
 	}
 
+	defaultConfigMapChanges := meaningfulchanges.ConfigMapKind(kind)
+	includeChanges := includes["changes"] || defaultConfigMapChanges
+	var recentChanges []issuesapi.RecentChange
+	var changesErr string
+	if includeChanges {
+		changes, err := meaningfulchanges.RecentForResource(ctx, kind, namespace, name, meaningfulchanges.DefaultSince, meaningfulchanges.ResourceLimit, meaningfulchanges.DefaultFieldLimit)
+		if err != nil {
+			changesErr = err.Error()
+		} else {
+			recentChanges = changes
+		}
+	}
+
 	// Three shapes:
 	//   - bare resource: no includes, context=none
 	//   - resource + resourceContext: no includes, default context
 	//   - resource + resourceContext + extras: includes set
-	if len(includes) == 0 && resourceCtx == nil && len(warnings) == 0 {
+	if len(includes) == 0 && resourceCtx == nil && len(warnings) == 0 && !defaultConfigMapChanges {
 		return toJSONResult(resourceData)
 	}
 
@@ -923,13 +949,20 @@ func handleGetResource(ctx context.Context, req *mcp.CallToolRequest, input getR
 	if len(warnings) > 0 {
 		result["warnings"] = warnings
 	}
+	if includeChanges {
+		if changesErr != "" {
+			result["recentChangesError"] = changesErr
+		} else if includes["changes"] || len(recentChanges) > 0 {
+			result["recentChanges"] = recentChanges
+		}
+	}
 	if len(includes) > 0 {
 		attachResourceExtras(ctx, cache, result, includes, kind, namespace, name)
 	}
 	return toJSONResult(result)
 }
 
-// buildMCPResourceContext assembles the resourceContext sidecar for MCP
+// buildMCPResourceContext assembles the resourceContext section for MCP
 // get_resource. Mirrors the REST handler's buildAIResourceContext: pre-
 // computes IssueSummary + AuditSummary in the caller, threads the
 // PolicyReport index when Kyverno is installed, hands a request-scoped
@@ -992,10 +1025,10 @@ func attachResourceExtras(ctx context.Context, cache *k8s.ResourceCache, result 
 				log.Printf("[mcp] Failed to list events for %s/%s/%s: %v", kind, namespace, name, listErr)
 				result["eventsError"] = listErr.Error()
 			} else {
-				// Sidecar include — controller-level events only. Pod-level
+				// Supplemental include — controller-level events only. Pod-level
 				// events on a workload's pods (CrashLoopBackOff, etc.) require
 				// resolving the pod set; that's the diagnose tool's job, not
-				// this sidecar's. nil podNames intentionally restricts to
+				// this include's. nil podNames intentionally restricts to
 				// InvolvedObject == this kind+name.
 				matched := filterEventsByInvolvedObject(events, normalizeDisplayKind(kind), name, nil)
 				if len(matched) > 0 {
@@ -1022,6 +1055,21 @@ func attachResourceExtras(ctx context.Context, cache *k8s.ResourceCache, result 
 		}
 	}
 
+	if includes["changes"] {
+		// The handler may have already attempted changes (data OR error key set).
+		// Gate on both — retrying after a recorded failure could attach a fresh
+		// payload next to the stale error, handing clients a contradictory result.
+		_, hasChanges := result["recentChanges"]
+		_, hasChangesErr := result["recentChangesError"]
+		if !hasChanges && !hasChangesErr {
+			if changes, err := meaningfulchanges.RecentForResource(ctx, kind, namespace, name, meaningfulchanges.DefaultSince, meaningfulchanges.ResourceLimit, meaningfulchanges.DefaultFieldLimit); err == nil {
+				result["recentChanges"] = changes
+			} else {
+				result["recentChangesError"] = err.Error()
+			}
+		}
+	}
+
 	// include=logs was dropped from get_resource (it was Pod-only and lacked
 	// container/previous/since/grep). Signal it explicitly rather than silently
 	// no-op'ing, so a client on a stale schema is redirected instead of seeing
@@ -1037,14 +1085,14 @@ func attachResourceExtras(ctx context.Context, cache *k8s.ResourceCache, result 
 	var unknown []string
 	for tok := range includes {
 		switch tok {
-		case "events", "metrics", "logs":
+		case "events", "metrics", "logs", "changes":
 		default:
 			unknown = append(unknown, tok)
 		}
 	}
 	if len(unknown) > 0 {
 		sort.Strings(unknown)
-		result["includeError"] = fmt.Sprintf("unknown include value(s): %s (valid: events, metrics)", strings.Join(unknown, ", "))
+		result["includeError"] = fmt.Sprintf("unknown include value(s): %s (valid: events, metrics, changes)", strings.Join(unknown, ", "))
 	}
 
 }
@@ -1094,11 +1142,6 @@ func isPodKind(kind string) bool {
 }
 
 func handleGetChanges(ctx context.Context, req *mcp.CallToolRequest, input getChangesInput) (*mcp.CallToolResult, any, error) {
-	store := timeline.GetStore()
-	if store == nil {
-		return nil, nil, fmt.Errorf("timeline store not initialized")
-	}
-
 	since := 1 * time.Hour
 	if input.Since != "" {
 		parsed, err := time.ParseDuration(input.Since)
@@ -1126,76 +1169,33 @@ func handleGetChanges(ctx context.Context, req *mcp.CallToolRequest, input getCh
 		return toJSONResult(getChangesResponseMCP{Changes: []mcpChange{}})
 	}
 
-	queryOpts := timeline.QueryOptions{
-		Since:        time.Now().Add(-since),
-		FilterPreset: "default",
+	query := meaningfulchanges.Query{
+		Since:      since,
+		Limit:      limit,
+		FieldLimit: meaningfulchanges.DefaultFieldLimit,
+		Name:       input.Name,
 	}
 	switch {
 	case input.Namespace != "":
-		queryOpts.Namespaces = []string{input.Namespace}
+		query.Namespaces = []string{input.Namespace}
 	case allowed != nil:
-		queryOpts.Namespaces = allowed
+		query.Namespaces = allowed
 	}
 	if input.Kind != "" {
-		queryOpts.Kinds = []string{input.Kind}
-	}
-	// When name filtering is needed client-side, fetch more to compensate for post-filter reduction
-	if input.Name != "" {
-		queryOpts.Limit = limit * 10
-	} else {
-		queryOpts.Limit = limit
+		query.Kinds = []string{input.Kind}
 	}
 
-	events, err := store.Query(ctx, queryOpts)
+	changes, capped, err := meaningfulchanges.Recent(ctx, query)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to query timeline: %w", err)
-	}
-	// Track whether the upstream store query hit its cap — if so there may
-	// be more changes outside the window even after client-side filtering.
-	upstreamCapped := len(events) >= queryOpts.Limit
-
-	// Client-side name filter (QueryOptions doesn't support name filtering)
-	if input.Name != "" {
-		filtered := events[:0]
-		for _, e := range events {
-			if e.Name == input.Name {
-				filtered = append(filtered, e)
-			}
-		}
-		events = filtered
-		if len(events) > limit {
-			events = events[:limit]
-		}
-	}
-
-	changes := make([]mcpChange, 0, len(events))
-	for _, e := range events {
-		summary := ""
-		if e.Diff != nil && e.Diff.Summary != "" {
-			summary = e.Diff.Summary
-		} else if e.Message != "" {
-			summary = k8s.Truncate(e.Message, 100)
-		}
-		changes = append(changes, mcpChange{
-			Kind:       e.Kind,
-			Namespace:  e.Namespace,
-			Name:       e.Name,
-			ChangeType: string(e.EventType),
-			Summary:    summary,
-			Timestamp:  e.Timestamp.Format(time.RFC3339),
-		})
 	}
 
 	// Always wrap so capped + uncapped agree on wire shape
 	// ({changes: [...], narrowHint?: "..."}).
 	resp := getChangesResponseMCP{Changes: changes}
-	if upstreamCapped {
-		// queryOpts.Limit is the actual store-side cap (10x when a name
-		// filter triggered fetch-extra). Citing `limit` would mislead
-		// the agent on the name-filter path where the real cap is higher.
+	if capped {
 		resp.NarrowHint = fmt.Sprintf(
-			"upstream feed capped at %d entries — narrow with namespace=, kind=, name=, shorten since= (e.g. 15m), or raise limit (cap 50)",
-			queryOpts.Limit,
+			"meaningful change candidates were capped before ranking — narrow with namespace=, kind=, name=, shorten since= (e.g. 15m), or raise limit (cap 50)",
 		)
 	}
 	return toJSONResult(resp)
@@ -1795,14 +1795,7 @@ type mcpDashboard struct {
 	Visibility         *k8s.VisibilitySummary `json:"visibility,omitempty"`
 }
 
-type mcpChange struct {
-	Kind       string `json:"kind"`
-	Namespace  string `json:"namespace,omitempty"`
-	Name       string `json:"name"`
-	ChangeType string `json:"changeType"`
-	Summary    string `json:"summary,omitempty"`
-	Timestamp  string `json:"timestamp"`
-}
+type mcpChange = issuesapi.RecentChange
 
 type mcpMetrics struct {
 	CPUUsagePercent   int `json:"cpuUsagePercent,omitempty"`
@@ -2307,9 +2300,10 @@ func buildDashboard(ctx context.Context, cache *k8s.ResourceCache, namespace str
 		}
 
 		queryOpts := timeline.QueryOptions{
-			Since:        now.Add(-1 * time.Hour),
-			Limit:        20,
-			FilterPreset: "workloads",
+			Since:          now.Add(-1 * time.Hour),
+			Limit:          20,
+			FilterPreset:   "workloads",
+			ClusterContext: k8s.ActiveClusterContext(),
 		}
 		if namespace != "" {
 			queryOpts.Namespaces = []string{namespace}
@@ -2465,6 +2459,19 @@ func handleIssuesTool(ctx context.Context, _ *mcp.CallToolRequest, input issuesI
 	resp.ClusterContext = provider.ClusterContextForIssues(allowedNamespaces, func(group, resource string) bool {
 		return canReadInNamespace(ctx, group, resource, "kube-system", "list")
 	})
+	if len(allowedNamespaces) == 1 && stats.TotalMatched == len(out) && meaningfulchanges.IssueChangesQueryEligible(input.Kind, input.Filter, input.Severity) {
+		if recentChangesReason := meaningfulchanges.IssueChangesReason(out); recentChangesReason != "" {
+			if changes, _, err := meaningfulchanges.Recent(ctx, meaningfulchanges.Query{
+				Namespaces: []string{allowedNamespaces[0]},
+				Since:      meaningfulchanges.DefaultSince,
+				Limit:      meaningfulchanges.IssueChangesLimit,
+				FieldLimit: meaningfulchanges.DefaultFieldLimit,
+			}); err == nil && len(changes) > 0 {
+				resp.RecentChanges = changes
+				resp.RecentChangesReason = recentChangesReason
+			}
+		}
+	}
 	// Steering hint when the issue list was capped (MCP-only).
 	if stats.TotalMatched > len(out) {
 		resp.NarrowHint = fmt.Sprintf(

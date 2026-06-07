@@ -24,8 +24,11 @@ type EventStore interface {
 	// GetEvent retrieves a single event by ID
 	GetEvent(ctx context.Context, id string) (*TimelineEvent, error)
 
-	// GetChangesForOwner retrieves changes for resources owned by the given owner
-	GetChangesForOwner(ctx context.Context, ownerKind, ownerNamespace, ownerName string, since time.Time, limit int) ([]TimelineEvent, error)
+	// GetChangesForOwner retrieves changes for resources owned by the given
+	// owner. clusterContext scopes to one cluster's events ("" = all) — owner
+	// identity (kind/namespace/name) collides across clusters in a persistent
+	// store, so current-cluster callers must pass it.
+	GetChangesForOwner(ctx context.Context, ownerKind, ownerNamespace, ownerName, clusterContext string, since time.Time, limit int) ([]TimelineEvent, error)
 
 	// MarkResourceSeen records that a resource has been seen (for dedup on restart)
 	MarkResourceSeen(kind, namespace, name string)
@@ -51,6 +54,12 @@ type QueryOptions struct {
 	Since      time.Time     // Filter events after this time
 	Until      time.Time     // Filter events before this time
 	Sources    []EventSource // Filter by event source (empty = all)
+	// ClusterContext scopes results to one cluster's events (empty = all).
+	// Anything answering "what happened on THIS cluster" must set it: the
+	// SQLite store outlives context switches, and rows written before the
+	// column existed carry "" (unknowable provenance), which a non-empty
+	// filter deliberately excludes.
+	ClusterContext string
 
 	// Filter preset (overrides individual filters if set)
 	FilterPreset string

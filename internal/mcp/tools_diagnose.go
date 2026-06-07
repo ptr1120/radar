@@ -16,6 +16,7 @@ import (
 
 	"github.com/skyhook-io/radar/internal/issues"
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/internal/meaningfulchanges"
 	aicontext "github.com/skyhook-io/radar/pkg/ai/context"
 	"github.com/skyhook-io/radar/pkg/issuesapi"
 	"github.com/skyhook-io/radar/pkg/k8score"
@@ -66,6 +67,7 @@ type diagnoseResponse struct {
 	// issue engine knows. Empty when nothing is wrong.
 	RelatedIssues []issues.Issue           `json:"relatedIssues,omitempty"`
 	ChangeContext *issuesapi.ChangeContext `json:"changeContext,omitempty"`
+	RecentChanges []issuesapi.RecentChange `json:"recentChanges,omitempty"`
 	// DNSContext is attached only when this diagnosed resource shows DNS
 	// symptoms or has non-default DNS settings. It includes cluster DNS facts
 	// without adding one kube-system issue to every namespaced issue list.
@@ -268,6 +270,9 @@ func handleDiagnose(ctx context.Context, _ *mcp.CallToolRequest, input diagnoseI
 				Name:      input.Name,
 			})
 		}
+	}
+	if changes, err := meaningfulchanges.RecentForWorkloadAndConfigMaps(ctx, obj, kindNorm, input.Namespace, input.Name, meaningfulchanges.DefaultSince, meaningfulchanges.ResourceLimit, meaningfulchanges.DefaultFieldLimit); err == nil && len(changes) > 0 {
+		resp.RecentChanges = changes
 	}
 	resp.DNSContext = dnsContextForDiagnose(ctx, cache, obj, pods, resp.LogsCurrent, resp.LogsPrevious, resp.Events)
 	resp.Warnings = k8score.EnrichRuntimeObjectWarnings(obj)
@@ -528,7 +533,7 @@ func fetchEventsForResource(cache *k8s.ResourceCache, kind, namespace, name stri
 //
 // Shared between diagnose (passes resolved pod names for full workload
 // coverage) and attachResourceExtras / get_resource include=events
-// (passes nil — sidecar fetch; callers wanting pod-level events should
+// (passes nil — supplemental fetch; callers wanting pod-level events should
 // use the diagnose tool which does the workload→pods resolution).
 func filterEventsByInvolvedObject(events []*corev1.Event, displayKind, name string, podNames map[string]bool) []corev1.Event {
 	var matched []corev1.Event

@@ -1664,3 +1664,214 @@ func TestDetectProblems_RolloutStuckExplainsRWORollingUpdate(t *testing.T) {
 		t.Fatalf("recreate rollout should not get RWO/RollingUpdate hint; got %q", recreate.Message)
 	}
 }
+
+// Pins the observedGeneration==1 issue_timing rule for stuck rollouts: gen 1 rescues
+// only the no-verdict (gray zone / missing LTT) case. A timestamp-backed
+// "started_after_resource_was_healthy" verdict must survive — generation only bumps on spec changes, so
+// a gen-1 Deployment that ran healthy then broke is still gen 1.
+func TestDetectProblems_RolloutStuckIssueTimingGen1(t *testing.T) {
+	defer ResetTestState()
+
+	now := time.Now()
+	stuckCond := func(ltt time.Time) []appsv1.DeploymentCondition {
+		return []appsv1.DeploymentCondition{{
+			Type:               appsv1.DeploymentProgressing,
+			Status:             corev1.ConditionFalse,
+			Reason:             "ProgressDeadlineExceeded",
+			Message:            "ReplicaSet has timed out progressing",
+			LastTransitionTime: metav1.NewTime(ltt),
+		}}
+	}
+	client := fake.NewClientset(
+		// Healthy ~2h, then stuck 10m ago → started_after_resource_was_healthy; gen==1 must not override.
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "gen1-runtime", Namespace: "prod", CreationTimestamp: metav1.NewTime(now.Add(-2 * time.Hour))},
+			Status:     appsv1.DeploymentStatus{ObservedGeneration: 1, Conditions: stuckCond(now.Add(-10 * time.Minute))},
+		},
+		// Gray zone (healthy ~4m of an 8m life) → no LTT verdict → gen==1 rescue.
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "gen1-gray", Namespace: "prod", CreationTimestamp: metav1.NewTime(now.Add(-8 * time.Minute))},
+			Status:     appsv1.DeploymentStatus{ObservedGeneration: 1, Conditions: stuckCond(now.Add(-4 * time.Minute))},
+		},
+		// Never healthy: Available=False pinned at creation outranks the
+		// recent Progressing LTT (which re-triggers on every rollout retry and
+		// would otherwise read as a months-long healthy window).
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "never-healthy", Namespace: "prod", CreationTimestamp: metav1.NewTime(now.Add(-2 * time.Hour))},
+			Status: appsv1.DeploymentStatus{ObservedGeneration: 5, Conditions: append(stuckCond(now.Add(-10*time.Minute)), appsv1.DeploymentCondition{
+				Type:               appsv1.DeploymentAvailable,
+				Status:             corev1.ConditionFalse,
+				Reason:             "MinimumReplicasUnavailable",
+				LastTransitionTime: metav1.NewTime(now.Add(-2 * time.Hour)),
+			})},
+		},
+	)
+
+	if err := InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+	cache := GetResourceCache()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var problems []Detection
+	for time.Now().Before(deadline) {
+		problems = DetectProblems(cache, "prod")
+		if hasProblem(problems, "Deployment", "gen1-runtime", "Rollout stuck") && hasProblem(problems, "Deployment", "gen1-gray", "Rollout stuck") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	rt, ok := lookupProblem(problems, "Deployment", "gen1-runtime", "Rollout stuck")
+	if !ok || rt.IssueTiming != "started_after_resource_was_healthy" || rt.IssueTimingBasis != "condition" {
+		t.Errorf("gen1-runtime issue_timing = (%q, %q), want (started_after_resource_was_healthy, condition); ok=%v", rt.IssueTiming, rt.IssueTimingBasis, ok)
+	}
+	gray, ok := lookupProblem(problems, "Deployment", "gen1-gray", "Rollout stuck")
+	if !ok || gray.IssueTiming != "started_at_resource_creation" || gray.IssueTimingBasis != "spec" {
+		t.Errorf("gen1-gray issue_timing = (%q, %q), want (started_at_resource_creation, spec); ok=%v", gray.IssueTiming, gray.IssueTimingBasis, ok)
+	}
+	nh, ok := lookupProblem(problems, "Deployment", "never-healthy", "Rollout stuck")
+	if !ok || nh.IssueTiming != "started_at_resource_creation" || nh.IssueTimingBasis != "condition" {
+		t.Errorf("never-healthy issue_timing = (%q, %q), want (started_at_resource_creation, condition); ok=%v", nh.IssueTiming, nh.IssueTimingBasis, ok)
+	}
+}
+
+// Pins the two pod-issue_timing paths: a crashloop pod created alongside a young
+// Deployment classifies started_at_resource_creation via creation-timestamp proximity
+// (pod_creation basis — the Available condition races with CrashLoopBackOff's
+// brief ready windows), while the same shape on an old Deployment with no
+// Available=False condition must omit issue_timing rather than guess.
+func TestDetectProblems_PodIssueTimingCreationProximity(t *testing.T) {
+	defer ResetTestState()
+
+	now := time.Now()
+	controller := true
+	crashloopPodR := func(name, rsName string, created time.Time, restarts int32) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: "prod", CreationTimestamp: metav1.NewTime(created),
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rsName, Controller: &controller}},
+			},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name:         "app",
+					RestartCount: restarts,
+					State:        corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+				}},
+			},
+		}
+	}
+	crashloopPod := func(name, rsName string, created time.Time) *corev1.Pod {
+		return crashloopPodR(name, rsName, created, 0)
+	}
+	rs := func(name, depName string, created time.Time) *appsv1.ReplicaSet {
+		return &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: "prod", CreationTimestamp: metav1.NewTime(created),
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: depName, Controller: &controller}},
+		}}
+	}
+	deployWithAvail := func(name string, created time.Time, avail corev1.ConditionStatus, availLTT time.Time) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod", CreationTimestamp: metav1.NewTime(created)},
+			Status: appsv1.DeploymentStatus{Conditions: []appsv1.DeploymentCondition{{
+				Type: appsv1.DeploymentAvailable, Status: avail, LastTransitionTime: metav1.NewTime(availLTT),
+			}}},
+		}
+	}
+
+	youngCreated := now.Add(-5 * time.Minute)
+	veteranCreated := now.Add(-2 * time.Hour)
+	client := fake.NewClientset(
+		// Young Deployment, pod created 40s after it → pod_creation started_at_resource_creation.
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "young", Namespace: "prod", CreationTimestamp: metav1.NewTime(youngCreated)}},
+		rs("young-1", "young", youngCreated),
+		crashloopPod("young-1-abc", "young-1", youngCreated.Add(40*time.Second)),
+		// Old Deployment, original pod crashing now, no Available=False → omit.
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "veteran", Namespace: "prod", CreationTimestamp: metav1.NewTime(veteranCreated)}},
+		rs("veteran-1", "veteran", veteranCreated),
+		crashloopPod("veteran-1-abc", "veteran-1", veteranCreated.Add(30*time.Second)),
+		// Backoff replacement: pod recreated 4m after the dep, but in the
+		// ORIGINAL RS (created with the dep) with restarts → backdate to deploy.
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "replaced", Namespace: "prod", CreationTimestamp: metav1.NewTime(now.Add(-10 * time.Minute))}},
+		rs("replaced-1", "replaced", now.Add(-10*time.Minute)),
+		crashloopPodR("replaced-1-abc", "replaced-1", now.Add(-6*time.Minute), 4),
+		// Mid-life rollout regression: NEW RS created 2m ago on a 10m-old dep;
+		// its crashing pod must NOT be backdated to deploy time.
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "midroll", Namespace: "prod", CreationTimestamp: metav1.NewTime(now.Add(-10 * time.Minute))}},
+		rs("midroll-1", "midroll", now.Add(-10*time.Minute)),
+		rs("midroll-2", "midroll", now.Add(-2*time.Minute)),
+		crashloopPodR("midroll-2-abc", "midroll-2", now.Add(-90*time.Second), 3),
+		// Chronic flapper: 2h-old deployment whose Available LTT keeps
+		// resetting as the crashloop cycles readiness. The flap-poisoned LTT
+		// must not produce after-healthy — omit.
+		deployWithAvail("flapper", now.Add(-2*time.Hour), corev1.ConditionFalse, now.Add(-5*time.Minute)),
+		rs("flapper-1", "flapper", now.Add(-2*time.Hour)),
+		crashloopPodR("flapper-1-abc", "flapper-1", now.Add(-30*time.Minute), 22),
+		// Never healthy: Available=False pinned at creation never went True —
+		// flap-immune proof of at-creation even for an old crashlooper.
+		deployWithAvail("nevergood", now.Add(-2*time.Hour), corev1.ConditionFalse, now.Add(-2*time.Hour)),
+		rs("nevergood-1", "nevergood", now.Add(-2*time.Hour)),
+		crashloopPodR("nevergood-1-abc", "nevergood-1", now.Add(-40*time.Minute), 22),
+		// Surge-rollout regression: new RS 20m ago while Available is still
+		// True (old pods serving) — the workload was demonstrably healthy
+		// before this rollout.
+		deployWithAvail("surge", now.Add(-2*time.Hour), corev1.ConditionTrue, now.Add(-2*time.Hour)),
+		rs("surge-1", "surge", now.Add(-2*time.Hour)),
+		rs("surge-2", "surge", now.Add(-20*time.Minute)),
+		crashloopPodR("surge-2-abc", "surge-2", now.Add(-18*time.Minute), 5),
+		// Stable-pod late failure: ImagePull-style pods never start, so
+		// readiness never cycles and the Available LTT is trustworthy.
+		deployWithAvail("latebreak", now.Add(-2*time.Hour), corev1.ConditionFalse, now.Add(-30*time.Minute)),
+		rs("latebreak-1", "latebreak", now.Add(-2*time.Hour)),
+		crashloopPodR("latebreak-1-abc", "latebreak-1", now.Add(-25*time.Minute), 0),
+	)
+
+	if err := InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+	cache := GetResourceCache()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var problems []Detection
+	for time.Now().Before(deadline) {
+		problems = DetectProblems(cache, "prod")
+		if hasProblem(problems, "Pod", "young-1-abc", "CrashLoopBackOff") && hasProblem(problems, "Pod", "veteran-1-abc", "CrashLoopBackOff") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	young, ok := lookupProblem(problems, "Pod", "young-1-abc", "CrashLoopBackOff")
+	if !ok || young.IssueTiming != "started_at_resource_creation" || young.IssueTimingBasis != "pod_creation" {
+		t.Errorf("young pod issue_timing = (%q, %q), want (started_at_resource_creation, pod_creation); ok=%v", young.IssueTiming, young.IssueTimingBasis, ok)
+	}
+	veteran, ok := lookupProblem(problems, "Pod", "veteran-1-abc", "CrashLoopBackOff")
+	if !ok || veteran.IssueTiming != "" || veteran.IssueTimingBasis != "" {
+		t.Errorf("veteran pod issue_timing = (%q, %q), want omitted; ok=%v", veteran.IssueTiming, veteran.IssueTimingBasis, ok)
+	}
+	replaced, ok := lookupProblem(problems, "Pod", "replaced-1-abc", "CrashLoopBackOff")
+	if !ok || replaced.IssueTiming != "started_at_resource_creation" || replaced.IssueTimingBasis != "pod_creation" {
+		t.Errorf("backoff-replacement pod issue_timing = (%q, %q), want (started_at_resource_creation, pod_creation); ok=%v", replaced.IssueTiming, replaced.IssueTimingBasis, ok)
+	}
+	midroll, ok := lookupProblem(problems, "Pod", "midroll-2-abc", "CrashLoopBackOff")
+	if !ok || midroll.IssueTiming == "started_at_resource_creation" {
+		t.Errorf("mid-rollout pod in a new RS must not be backdated to deploy time, got (%q, %q); ok=%v", midroll.IssueTiming, midroll.IssueTimingBasis, ok)
+	}
+	flapper, ok := lookupProblem(problems, "Pod", "flapper-1-abc", "CrashLoopBackOff")
+	if !ok || flapper.IssueTiming != "" {
+		t.Errorf("chronic flapper must omit issue_timing (flap-poisoned Available LTT), got (%q, %q); ok=%v", flapper.IssueTiming, flapper.IssueTimingBasis, ok)
+	}
+	nevergood, ok := lookupProblem(problems, "Pod", "nevergood-1-abc", "CrashLoopBackOff")
+	if !ok || nevergood.IssueTiming != "started_at_resource_creation" || nevergood.IssueTimingBasis != "owner_condition" {
+		t.Errorf("never-healthy crashlooper = (%q, %q), want (started_at_resource_creation, owner_condition); ok=%v", nevergood.IssueTiming, nevergood.IssueTimingBasis, ok)
+	}
+	surge, ok := lookupProblem(problems, "Pod", "surge-2-abc", "CrashLoopBackOff")
+	if !ok || surge.IssueTiming != "started_after_resource_was_healthy" || surge.IssueTimingBasis != "pod_creation" {
+		t.Errorf("surge-rollout pod = (%q, %q), want (started_after_resource_was_healthy, pod_creation); ok=%v", surge.IssueTiming, surge.IssueTimingBasis, ok)
+	}
+	latebreak, ok := lookupProblem(problems, "Pod", "latebreak-1-abc", "CrashLoopBackOff")
+	if !ok || latebreak.IssueTiming != "started_after_resource_was_healthy" || latebreak.IssueTimingBasis != "owner_condition" {
+		t.Errorf("stable-pod late failure = (%q, %q), want (started_after_resource_was_healthy, owner_condition); ok=%v", latebreak.IssueTiming, latebreak.IssueTimingBasis, ok)
+	}
+}

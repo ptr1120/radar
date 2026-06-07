@@ -86,11 +86,13 @@ func DetectCAPIProblems(dynamicCache *DynamicResourceCache, discovery *ResourceD
 			if d == 0 {
 				d = ageDur
 			}
+			timing, timingBasis := capiIssueTiming(dur, cl.GetCreationTimestamp().Time)
 			problems = append(problems, Detection{
 				Kind: "Cluster", Namespace: cl.GetNamespace(), Name: cl.GetName(), Group: capiGroup,
 				Severity: severity, Reason: displayReason, Message: msg,
 				Age: FormatAge(ageDur), AgeSeconds: int64(ageDur.Seconds()),
 				Duration: FormatAge(d), DurationSeconds: int64(d.Seconds()),
+				IssueTiming: timing, IssueTimingBasis: timingBasis,
 			})
 		}
 	}
@@ -157,11 +159,13 @@ func DetectCAPIProblems(dynamicCache *DynamicResourceCache, discovery *ResourceD
 			if d == 0 {
 				d = ageDur
 			}
+			timing, timingBasis := capiIssueTiming(dur, m.GetCreationTimestamp().Time)
 			problems = append(problems, Detection{
 				Kind: "Machine", Namespace: m.GetNamespace(), Name: m.GetName(), Group: capiGroup,
 				Severity: severity, Reason: displayReason, Message: msg,
 				Age: FormatAge(ageDur), AgeSeconds: int64(ageDur.Seconds()),
 				Duration: FormatAge(d), DurationSeconds: int64(d.Seconds()),
+				IssueTiming: timing, IssueTimingBasis: timingBasis,
 			})
 		}
 	}
@@ -199,11 +203,13 @@ func DetectCAPIProblems(dynamicCache *DynamicResourceCache, discovery *ResourceD
 			if d == 0 {
 				d = ageDur
 			}
+			timing, timingBasis := capiIssueTiming(dur, md.GetCreationTimestamp().Time)
 			problems = append(problems, Detection{
 				Kind: "MachineDeployment", Namespace: md.GetNamespace(), Name: md.GetName(), Group: capiGroup,
 				Severity: "high", Reason: capiDisplayReason(ct, reason), Message: msg,
 				Age: FormatAge(ageDur), AgeSeconds: int64(ageDur.Seconds()),
 				Duration: FormatAge(d), DurationSeconds: int64(d.Seconds()),
+				IssueTiming: timing, IssueTimingBasis: timingBasis,
 			})
 		}
 	}
@@ -231,11 +237,13 @@ func DetectCAPIProblems(dynamicCache *DynamicResourceCache, discovery *ResourceD
 			if d == 0 {
 				d = ageDur
 			}
+			timing, timingBasis := capiIssueTiming(dur, kcp.GetCreationTimestamp().Time)
 			problems = append(problems, Detection{
 				Kind: "KubeadmControlPlane", Namespace: kcp.GetNamespace(), Name: kcp.GetName(), Group: capiCPGroup,
 				Severity: severity, Reason: displayReason, Message: msg,
 				Age: FormatAge(ageDur), AgeSeconds: int64(ageDur.Seconds()),
 				Duration: FormatAge(d), DurationSeconds: int64(d.Seconds()),
+				IssueTiming: timing, IssueTimingBasis: timingBasis,
 			})
 		}
 	}
@@ -269,11 +277,13 @@ func DetectCAPIProblems(dynamicCache *DynamicResourceCache, discovery *ResourceD
 			if d == 0 {
 				d = ageDur
 			}
+			timing, timingBasis := capiIssueTiming(dur, mhc.GetCreationTimestamp().Time)
 			problems = append(problems, Detection{
 				Kind: "MachineHealthCheck", Namespace: mhc.GetNamespace(), Name: mhc.GetName(), Group: capiGroup,
 				Severity: "high", Reason: capiDisplayReason(ct, reason), Message: msg,
 				Age: FormatAge(ageDur), AgeSeconds: int64(ageDur.Seconds()),
 				Duration: FormatAge(d), DurationSeconds: int64(d.Seconds()),
+				IssueTiming: timing, IssueTimingBasis: timingBasis,
 			})
 		}
 	}
@@ -286,6 +296,17 @@ func capiDisplayReason(condType, reason string) string {
 		return reason
 	}
 	return condType + "=False"
+}
+
+// capiIssueTiming computes issue_timing for a CAPI condition-based Detection.
+// dur is the raw FindFalseCondition since-duration; createdAt is the resource's
+// creationTimestamp. Returns empty strings when dur==0 (no LTT available).
+func capiIssueTiming(dur time.Duration, createdAt time.Time) (timing, basis string) {
+	if dur == 0 {
+		return "", ""
+	}
+	r := IssueTimingFromConditionLTT(time.Now().Add(-dur), createdAt, "condition")
+	return r.IssueTiming, r.Basis
 }
 
 func capiConditionCurrent(u *unstructured.Unstructured, reason string) bool {

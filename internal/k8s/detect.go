@@ -76,6 +76,18 @@ type Detection struct {
 	// cause is its own row. MUST be stable across polls (don't use a flapping
 	// reason or a count); empty means "fold by category" (the common case).
 	Fingerprint string
+	// IssueTiming + IssueTimingBasis carry best-effort timing evidence derived at
+	// detection time, where typed K8s objects are in hand. Empty = no confident
+	// signal; the issues layer copies them to the Issue and the API omits them
+	// (omitempty). Do NOT set these unless the signal is clean; absent timing
+	// is honest while a wrong one misleads agents.
+	//
+	// IssueTiming values:
+	//   "started_at_resource_creation"        — failing state began during creation/first reconciliation.
+	//   "started_after_resource_was_healthy"  — a meaningful healthy window preceded the failing state.
+	// Basis values: "condition" | "owner_condition" | "pod_creation" | "deletion" | "phase" | "spec".
+	IssueTiming      string
+	IssueTimingBasis string
 }
 
 // podOwnerKindName resolves a Pod's topmost stable controller for issue
@@ -130,47 +142,58 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 				if !replicaFailure.LastTransitionTime.IsZero() {
 					durDur = now.Sub(replicaFailure.LastTransitionTime.Time)
 				}
+				timingR := IssueTimingFromConditionLTT(replicaFailure.LastTransitionTime.Time, d.CreationTimestamp.Time, "condition")
+				if deploymentNeverHealthy(d) {
+					timingR = IssueTimingResult{IssueTiming: "started_at_resource_creation", Basis: "condition"}
+				}
 				problems = append(problems, Detection{
-					Kind:            "Deployment",
-					Namespace:       d.Namespace,
-					Name:            d.Name,
-					Group:           "apps",
-					Severity:        "critical",
-					Reason:          "ReplicaFailure",
-					Message:         replicaFailure.Message,
-					Fingerprint:     "deployment:replica-failure",
-					Age:             FormatAge(ageDur),
-					AgeSeconds:      int64(ageDur.Seconds()),
-					Duration:        FormatAge(durDur),
-					DurationSeconds: int64(durDur.Seconds()),
+					Kind:             "Deployment",
+					Namespace:        d.Namespace,
+					Name:             d.Name,
+					Group:            "apps",
+					Severity:         "critical",
+					Reason:           "ReplicaFailure",
+					Message:          replicaFailure.Message,
+					Fingerprint:      "deployment:replica-failure",
+					Age:              FormatAge(ageDur),
+					AgeSeconds:       int64(ageDur.Seconds()),
+					Duration:         FormatAge(durDur),
+					DurationSeconds:  int64(durDur.Seconds()),
+					IssueTiming:      timingR.IssueTiming,
+					IssueTimingBasis: timingR.Basis,
 				})
 			}
 
 			if d.Status.UnavailableReplicas > 0 && stuck == nil && replicaFailure == nil {
 				ageDur := now.Sub(d.CreationTimestamp.Time)
 				durDur := ageDur // fallback to creation time
+				var availCondLTT time.Time
 				for _, cond := range d.Status.Conditions {
 					if cond.Type == appsv1.DeploymentAvailable && cond.Status == "False" && !cond.LastTransitionTime.IsZero() {
 						durDur = now.Sub(cond.LastTransitionTime.Time)
+						availCondLTT = cond.LastTransitionTime.Time
 						break
 					}
 				}
+				timingR := IssueTimingFromConditionLTT(availCondLTT, d.CreationTimestamp.Time, "condition")
 				// Report available/DESIRED: spec.replicas is the authoritative goal
 				// (nil defaults to 1; a scale-down's terminating pods inflate
 				// status.replicas above the target). schedDesiredReplicas encodes
 				// the nil→1 default.
 				desired := schedDesiredReplicas(d.Spec.Replicas)
 				problems = append(problems, Detection{
-					Kind:            "Deployment",
-					Namespace:       d.Namespace,
-					Name:            d.Name,
-					Group:           "apps",
-					Severity:        "critical",
-					Reason:          fmt.Sprintf("%d/%d available", d.Status.AvailableReplicas, desired),
-					Age:             FormatAge(ageDur),
-					AgeSeconds:      int64(ageDur.Seconds()),
-					Duration:        FormatAge(durDur),
-					DurationSeconds: int64(durDur.Seconds()),
+					Kind:             "Deployment",
+					Namespace:        d.Namespace,
+					Name:             d.Name,
+					Group:            "apps",
+					Severity:         "critical",
+					Reason:           fmt.Sprintf("%d/%d available", d.Status.AvailableReplicas, desired),
+					Age:              FormatAge(ageDur),
+					AgeSeconds:       int64(ageDur.Seconds()),
+					Duration:         FormatAge(durDur),
+					DurationSeconds:  int64(durDur.Seconds()),
+					IssueTiming:      timingR.IssueTiming,
+					IssueTimingBasis: timingR.Basis,
 				})
 			}
 
@@ -187,18 +210,38 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 						message = detail
 					}
 				}
+				// Progressing's LTT re-triggers on every rollout retry, so on a
+				// never-healthy Deployment it reads as a recent transition and the
+				// classifier would claim a healthy window that never existed. The
+				// Available condition is the authority on "was it ever healthy":
+				// Available=False whose LTT sits at creation means it never went
+				// True — override to at-creation before trusting Progressing.
+				timingR := IssueTimingFromConditionLTT(stuck.LastTransitionTime.Time, d.CreationTimestamp.Time, "condition")
+				if deploymentNeverHealthy(d) {
+					timingR = IssueTimingResult{IssueTiming: "started_at_resource_creation", Basis: "condition"}
+				} else if timingR.IssueTiming == "" && d.Status.ObservedGeneration == 1 {
+					// observedGeneration==1 rescues only the no-verdict case for
+					// first-ever rollouts (slow clusters can exceed
+					// progressDeadlineSeconds on gen 1). It must not override a
+					// timestamp-backed verdict: generation only bumps on spec
+					// changes, so a gen-1 Deployment that ran healthy for months
+					// and then broke (image gone, node loss) is still gen 1.
+					timingR = IssueTimingResult{IssueTiming: "started_at_resource_creation", Basis: "spec"}
+				}
 				problems = append(problems, Detection{
-					Kind:            "Deployment",
-					Namespace:       d.Namespace,
-					Name:            d.Name,
-					Group:           "apps",
-					Severity:        "critical",
-					Reason:          "Rollout stuck",
-					Message:         message,
-					Age:             FormatAge(now.Sub(d.CreationTimestamp.Time)),
-					AgeSeconds:      int64(now.Sub(d.CreationTimestamp.Time).Seconds()),
-					Duration:        FormatAge(durDur),
-					DurationSeconds: int64(durDur.Seconds()),
+					Kind:             "Deployment",
+					Namespace:        d.Namespace,
+					Name:             d.Name,
+					Group:            "apps",
+					Severity:         "critical",
+					Reason:           "Rollout stuck",
+					Message:          message,
+					Age:              FormatAge(now.Sub(d.CreationTimestamp.Time)),
+					AgeSeconds:       int64(now.Sub(d.CreationTimestamp.Time).Seconds()),
+					Duration:         FormatAge(durDur),
+					DurationSeconds:  int64(durDur.Seconds()),
+					IssueTiming:      timingR.IssueTiming,
+					IssueTimingBasis: timingR.Basis,
 				})
 			}
 		}
@@ -332,6 +375,95 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 				message = init.message
 				fingerprint = init.fingerprint
 			}
+			// IssueTiming: classify whether this pod has been failing since the Deployment
+			// was first created (started_at_resource_creation) or broke after a period of
+			// healthy operation (started_after_resource_was_healthy).
+			//
+			// The central hazard: restart-driven readiness cycling (CrashLoopBackOff,
+			// OOM loops, liveness kills) flips the owner's Available condition
+			// True↔False on every crash, so its lastTransitionTime stops marking
+			// when the problem started. Every branch below is chosen to be
+			// flap-immune; when no flap-immune evidence exists, timing is omitted —
+			// an absent answer is honest, a flap-derived one actively misleads.
+			//
+			//  1. Never-healthy proof: Available=False whose LTT sits at creation
+			//     never went True — it cannot have flapped. At-creation, any age.
+			//  2. Young original rollout (<15min, pod or its RS created with the
+			//     Deployment): creation-timestamp proximity. The 15-minute cap
+			//     keeps month-old original pods that crash later (memory leak)
+			//     from being misread as deploy-time faults.
+			//  3. Surge-rollout regression: the pod belongs to a NEW ReplicaSet
+			//     while Available is still True (old RS pods serving) — the
+			//     workload was demonstrably healthy and this rollout brought the
+			//     failure. failingSince = RS creation. Available=False new-RS
+			//     cases are deliberately NOT classified: a broken→broken rollout
+			//     (never-healthy workload, failed fix attempt) is
+			//     indistinguishable from a regression there.
+			//  4. Restart-cycling pods (restartCount ≥ 3) past those branches:
+			//     omit — the Available LTT is flap-poisoned.
+			//  5. Otherwise (old deployment, stable pods — e.g. ImagePullBackOff
+			//     pods that never start, so readiness never cycles): the
+			//     Available=False LTT is trustworthy; classify from it.
+			//
+			// Basis "pod_creation" documents creation-timestamp evidence (pod or
+			// ReplicaSet vs Deployment); "owner_condition" documents owner
+			// condition LTT evidence.
+			const maxDeployAgeForProximityIssueTiming = 15 * time.Minute
+			const establishedRestartLoop = 3
+			var podIssueTiming IssueTimingResult
+			if ownerKind == "Deployment" && ownerName != "" {
+				if depLister := cache.Deployments(); depLister != nil {
+					if dep, err := depLister.Deployments(pod.Namespace).Get(ownerName); err == nil {
+						depAge := now.Sub(dep.CreationTimestamp.Time)
+						podAge := now.Sub(pod.CreationTimestamp.Time)
+						podCreatedWithDeploy := depAge > 0 && (depAge-podAge) < 60*time.Second
+						// The owning ReplicaSet anchors rollout identity: backoff
+						// recreations stay in the original RS, while a mid-life
+						// rollout or scale-up creates a NEW RS.
+						var ownRS *appsv1.ReplicaSet
+						if rsLister := cache.ReplicaSets(); rsLister != nil {
+							for _, ref := range pod.OwnerReferences {
+								if ref.Kind != "ReplicaSet" {
+									continue
+								}
+								if rs, rsErr := rsLister.ReplicaSets(pod.Namespace).Get(ref.Name); rsErr == nil {
+									ownRS = rs
+								}
+								break
+							}
+						}
+						rsCreatedWithDeploy := ownRS != nil && ownRS.CreationTimestamp.Time.Sub(dep.CreationTimestamp.Time) < 60*time.Second
+						rsIsNewRollout := ownRS != nil && !rsCreatedWithDeploy
+						var availCond *appsv1.DeploymentCondition
+						for i := range dep.Status.Conditions {
+							if dep.Status.Conditions[i].Type == appsv1.DeploymentAvailable {
+								availCond = &dep.Status.Conditions[i]
+								break
+							}
+						}
+						switch {
+						case deploymentNeverHealthy(dep):
+							podIssueTiming = IssueTimingResult{IssueTiming: "started_at_resource_creation", Basis: "owner_condition"}
+						case depAge <= maxDeployAgeForProximityIssueTiming && (podCreatedWithDeploy || rsCreatedWithDeploy):
+							// Original pod uses its own creation as the failingSince
+							// proxy; a backoff replacement (recreated minutes later in
+							// the original RS) backdates to Deployment creation so
+							// healthyFor≈0 lands in the at-creation slop.
+							failingSince := pod.CreationTimestamp.Time
+							if !podCreatedWithDeploy {
+								failingSince = dep.CreationTimestamp.Time
+							}
+							podIssueTiming = IssueTimingFromConditionLTT(failingSince, dep.CreationTimestamp.Time, "pod_creation")
+						case rsIsNewRollout && availCond != nil && availCond.Status == corev1.ConditionTrue:
+							podIssueTiming = IssueTimingFromConditionLTT(ownRS.CreationTimestamp.Time, dep.CreationTimestamp.Time, "pod_creation")
+						case restartCount >= establishedRestartLoop:
+							// flap-poisoned Available LTT — omit
+						case availCond != nil && availCond.Status == corev1.ConditionFalse && !availCond.LastTransitionTime.IsZero():
+							podIssueTiming = IssueTimingFromConditionLTT(availCond.LastTransitionTime.Time, dep.CreationTimestamp.Time, "owner_condition")
+						}
+					}
+				}
+			}
 			problems = append(problems, Detection{
 				Kind:                 "Pod",
 				Namespace:            pod.Namespace,
@@ -349,6 +481,8 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 				OwnerGroup:           ownerGroup,
 				OwnerKind:            ownerKind,
 				OwnerName:            ownerName,
+				IssueTiming:          podIssueTiming.IssueTiming,
+				IssueTimingBasis:     podIssueTiming.Basis,
 			})
 		}
 	}
@@ -500,6 +634,33 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 				severity = "critical"
 			}
 			ageDur := resourceAge(now, hpas, hp.Namespace, hp.Name)
+			// IssueTiming for cannot-scale only: use ScalingActive condition LTT.
+			// "maxed" carries no issue_timing — hitting the replica ceiling is a
+			// capacity concern that doesn't cleanly map to
+			// started_at_resource_creation vs started_after_resource_was_healthy.
+			var hpaIssueTiming IssueTimingResult
+			var hpaCondDur time.Duration
+			if hp.Problem == "cannot-scale" {
+				for _, hpa := range hpas {
+					if hpa.Name != hp.Name || hpa.Namespace != hp.Namespace {
+						continue
+					}
+					for _, cond := range hpa.Status.Conditions {
+						if cond.Type == autoscalingv2.ScalingActive && cond.Status == corev1.ConditionFalse && !cond.LastTransitionTime.IsZero() {
+							hpaCondDur = now.Sub(cond.LastTransitionTime.Time)
+							hpaIssueTiming = IssueTimingFromConditionLTT(cond.LastTransitionTime.Time, hpa.CreationTimestamp.Time, "condition")
+							break
+						}
+					}
+					break
+				}
+			}
+			// Use the condition LTT for Duration when available so first_seen
+			// stays coherent with issue_timing instead of falling back to resource age.
+			hpaDur := hpaCondDur
+			if hpaDur == 0 {
+				hpaDur = ageDur
+			}
 			problems = append(problems, Detection{
 				Kind:      "HorizontalPodAutoscaler",
 				Namespace: hp.Namespace,
@@ -511,9 +672,13 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 				// One HPA can be BOTH maxed and unable-to-scale at once — distinct
 				// problems with distinct fixes. Fingerprint on the problem kind so
 				// they don't collapse into one hpa_limited_or_failed row.
-				Fingerprint: "hpa:" + hp.Problem,
-				Age:         FormatAge(ageDur),
-				AgeSeconds:  int64(ageDur.Seconds()),
+				Fingerprint:      "hpa:" + hp.Problem,
+				Age:              FormatAge(ageDur),
+				AgeSeconds:       int64(ageDur.Seconds()),
+				Duration:         FormatAge(hpaDur),
+				DurationSeconds:  int64(hpaDur.Seconds()),
+				IssueTiming:      hpaIssueTiming.IssueTiming,
+				IssueTimingBasis: hpaIssueTiming.Basis,
 			})
 		}
 	}
@@ -591,20 +756,64 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 		nodes, _ := nodeLister.List(labels.Everything())
 		for _, np := range DetectNodeProblems(nodes) {
 			ageDur := time.Duration(0)
+			var nodeIssueTiming IssueTimingResult
+			var nodeCondDur time.Duration
 			for _, n := range nodes {
-				if n.Name == np.NodeName {
-					ageDur = now.Sub(n.CreationTimestamp.Time)
-					break
+				if n.Name != np.NodeName {
+					continue
 				}
+				ageDur = now.Sub(n.CreationTimestamp.Time)
+				// Map each problem type to its own condition so issue_timing and
+				// DurationSeconds reflect the right LTT:
+				//   NotReady      → NodeReady condition
+				//   *Pressure     → matching pressure condition
+				//   Cordoned      → no condition, omit issue_timing
+				var targetCondType corev1.NodeConditionType
+				switch np.Problem {
+				case "NotReady":
+					targetCondType = corev1.NodeReady
+				case "MemoryPressure":
+					targetCondType = corev1.NodeMemoryPressure
+				case "DiskPressure":
+					targetCondType = corev1.NodeDiskPressure
+				case "PIDPressure":
+					targetCondType = corev1.NodePIDPressure
+				}
+				if targetCondType != "" {
+					for _, cond := range n.Status.Conditions {
+						if cond.Type != targetCondType || cond.LastTransitionTime.IsZero() {
+							continue
+						}
+						// Ready=False or pressure=True both mean the condition is active.
+						if targetCondType == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
+							continue
+						}
+						if targetCondType != corev1.NodeReady && cond.Status != corev1.ConditionTrue {
+							continue
+						}
+						nodeCondDur = now.Sub(cond.LastTransitionTime.Time)
+						nodeIssueTiming = IssueTimingFromConditionLTT(cond.LastTransitionTime.Time, n.CreationTimestamp.Time, "condition")
+						break
+					}
+				}
+				break
+			}
+			nodeDur := nodeCondDur
+			if nodeDur == 0 {
+				nodeDur = ageDur
 			}
 			problems = append(problems, Detection{
-				Kind:       "Node",
-				Name:       np.NodeName,
-				Severity:   np.Severity,
-				Reason:     np.Problem,
-				Message:    np.Reason,
-				Age:        FormatAge(ageDur),
-				AgeSeconds: int64(ageDur.Seconds()),
+				Kind:             "Node",
+				Name:             np.NodeName,
+				Severity:         np.Severity,
+				Reason:           np.Problem,
+				Message:          np.Reason,
+				Age:              FormatAge(ageDur),
+				AgeSeconds:       int64(ageDur.Seconds()),
+				Duration:         FormatAge(nodeDur),
+				DurationSeconds:  int64(nodeDur.Seconds()),
+				IssueTiming:      nodeIssueTiming.IssueTiming,
+				IssueTimingBasis: nodeIssueTiming.Basis,
 			})
 		}
 	}
@@ -635,22 +844,37 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 					AgeSeconds:      int64(ageDur.Seconds()),
 					Duration:        FormatAge(ageDur),
 					DurationSeconds: int64(ageDur.Seconds()),
+					// IssueTiming omitted: Phase=Lost happened after the PVC existed, but
+					// there is no condition LTT or event timestamp available at this
+					// site. first_seen would show resource age, inconsistent with an
+					// started_after_resource_was_healthy classification.
 				})
 				continue
 			}
 			if resize := pvcResizeProblem(pvc); resize.reason != "" {
+				// Timing requires a real condition LTT — without one, Duration
+				// falls back to resource age and first_seen would contradict the
+				// label (same rule as the Lost/Failed sites). With one, run the
+				// classifier like every other site: a resize error moments after
+				// PVC creation is at-creation/gray, not a post-healthy regression.
+				var resizeIssueTiming IssueTimingResult
+				if !resize.lastTransitionTime.IsZero() {
+					resizeIssueTiming = IssueTimingFromConditionLTT(resize.lastTransitionTime.Time, pvc.CreationTimestamp.Time, "condition")
+				}
 				problems = append(problems, Detection{
-					Kind:            "PersistentVolumeClaim",
-					Namespace:       pvc.Namespace,
-					Name:            pvc.Name,
-					Severity:        resize.severity,
-					Reason:          resize.reason,
-					Message:         resize.message,
-					Fingerprint:     "pvc:resize:" + resize.reason,
-					Age:             FormatAge(ageDur),
-					AgeSeconds:      int64(ageDur.Seconds()),
-					Duration:        FormatAge(resize.duration(now, ageDur)),
-					DurationSeconds: int64(resize.duration(now, ageDur).Seconds()),
+					Kind:             "PersistentVolumeClaim",
+					Namespace:        pvc.Namespace,
+					Name:             pvc.Name,
+					Severity:         resize.severity,
+					Reason:           resize.reason,
+					Message:          resize.message,
+					Fingerprint:      "pvc:resize:" + resize.reason,
+					Age:              FormatAge(ageDur),
+					AgeSeconds:       int64(ageDur.Seconds()),
+					Duration:         FormatAge(resize.duration(now, ageDur)),
+					DurationSeconds:  int64(resize.duration(now, ageDur).Seconds()),
+					IssueTiming:      resizeIssueTiming.IssueTiming,
+					IssueTimingBasis: resizeIssueTiming.Basis,
 				})
 			}
 			if pvc.Status.Phase == corev1.ClaimPending {
@@ -675,6 +899,10 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 						AgeSeconds:      int64(ageDur.Seconds()),
 						Duration:        FormatAge(ageDur),
 						DurationSeconds: int64(ageDur.Seconds()),
+						// Phase=Pending since creation means the PVC has never been bound —
+						// present since creation (wrong StorageClass, missing or failing provisioner).
+						IssueTiming:      "started_at_resource_creation",
+						IssueTimingBasis: "phase",
 					})
 				}
 			}
@@ -702,6 +930,9 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 				AgeSeconds:      int64(ageDur.Seconds()),
 				Duration:        FormatAge(ageDur),
 				DurationSeconds: int64(ageDur.Seconds()),
+				// IssueTiming omitted: Phase=Failed happened after the PV existed, but
+				// no condition LTT or event timestamp is available here; first_seen
+				// would show resource age, contradicting started_after_resource_was_healthy.
 			})
 		}
 	}
@@ -1002,19 +1233,28 @@ func terminatingProblem(kind, group string, obj metav1.Object, now time.Time) (D
 	if finalizers := obj.GetFinalizers(); len(finalizers) > 0 {
 		msg = "Waiting on finalizers: " + strings.Join(finalizers, ", ")
 	}
+	// The stuck-termination issue began when deletion was requested — run the
+	// classifier against the deletionTimestamp like any other timing site. A
+	// resource deleted right after creation classifies at-creation; one that
+	// existed for a real window before deletion classifies post-healthy. A
+	// hardcoded post-healthy label would overstate the evidence for
+	// create-then-delete churn.
+	timingR := IssueTimingFromConditionLTT(obj.GetDeletionTimestamp().Time, obj.GetCreationTimestamp().Time, "deletion")
 	return Detection{
-		Kind:            kind,
-		Group:           group,
-		Namespace:       obj.GetNamespace(),
-		Name:            obj.GetName(),
-		Severity:        severity,
-		Reason:          "Terminating stuck",
-		Message:         msg,
-		Fingerprint:     "lifecycle:terminating",
-		Age:             FormatAge(now.Sub(obj.GetCreationTimestamp().Time)),
-		AgeSeconds:      int64(now.Sub(obj.GetCreationTimestamp().Time).Seconds()),
-		Duration:        FormatAge(duration),
-		DurationSeconds: int64(duration.Seconds()),
+		Kind:             kind,
+		Group:            group,
+		Namespace:        obj.GetNamespace(),
+		Name:             obj.GetName(),
+		Severity:         severity,
+		Reason:           "Terminating stuck",
+		Message:          msg,
+		Fingerprint:      "lifecycle:terminating",
+		Age:              FormatAge(now.Sub(obj.GetCreationTimestamp().Time)),
+		AgeSeconds:       int64(now.Sub(obj.GetCreationTimestamp().Time).Seconds()),
+		Duration:         FormatAge(duration),
+		DurationSeconds:  int64(duration.Seconds()),
+		IssueTiming:      timingR.IssueTiming,
+		IssueTimingBasis: timingR.Basis,
 	}, true
 }
 
@@ -1380,6 +1620,25 @@ func deploymentReplicaFailure(dep *appsv1.Deployment) *appsv1.DeploymentConditio
 		}
 	}
 	return nil
+}
+
+// deploymentNeverHealthy reports whether the Deployment's Available condition
+// proves it was never healthy: Available=False with a lastTransitionTime still
+// sitting at creation means it never once went True. This is flap-immune
+// evidence — a condition that never transitioned can't have had its LTT reset —
+// and outranks Progressing/ReplicaFailure timestamps, which re-trigger on
+// retries. The 30s slop mirrors the classifier's condition-propagation slop.
+func deploymentNeverHealthy(dep *appsv1.Deployment) bool {
+	if dep == nil {
+		return false
+	}
+	for i := range dep.Status.Conditions {
+		cond := &dep.Status.Conditions[i]
+		if cond.Type == appsv1.DeploymentAvailable && cond.Status == corev1.ConditionFalse && !cond.LastTransitionTime.IsZero() {
+			return cond.LastTransitionTime.Time.Sub(dep.CreationTimestamp.Time) < 30*time.Second
+		}
+	}
+	return false
 }
 
 func deploymentProgressDeadlineExceeded(dep *appsv1.Deployment) *appsv1.DeploymentCondition {
