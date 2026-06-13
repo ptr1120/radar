@@ -190,7 +190,7 @@ func handleDiagnose(ctx context.Context, _ *mcp.CallToolRequest, input diagnoseI
 
 	obj, err := k8s.FetchResource(cache, kindNorm, input.Namespace, input.Name)
 	if err != nil {
-		return nil, nil, fmt.Errorf("resource not found: %w", err)
+		return nil, nil, notFoundError(ctx, err, kindNorm, input.Namespace, input.Name)
 	}
 	k8s.SetTypeMeta(obj)
 	gvk := obj.GetObjectKind().GroupVersionKind()
@@ -296,7 +296,7 @@ func handleDiagnose(ctx context.Context, _ *mcp.CallToolRequest, input diagnoseI
 			})
 		}
 	}
-	if changes, err := meaningfulchanges.RecentForWorkloadAndConfigMaps(ctx, obj, kindNorm, input.Namespace, input.Name, meaningfulchanges.DefaultSince, meaningfulchanges.ResourceLimit, meaningfulchanges.DefaultFieldLimit); err == nil && len(changes) > 0 {
+	if changes, _, err := meaningfulchanges.RecentForWorkloadAndConfigMaps(ctx, obj, kindNorm, input.Namespace, input.Name, meaningfulchanges.DefaultSince, meaningfulchanges.ResourceLimit, meaningfulchanges.DefaultFieldLimit); err == nil && len(changes) > 0 {
 		resp.RecentChanges = changes
 	}
 	resp.DNSContext = dnsContextForDiagnose(ctx, cache, obj, pods, resp.LogsCurrent, resp.LogsPrevious, resp.Events)
@@ -373,7 +373,7 @@ func handleGitOpsDiagnose(ctx context.Context, input diagnoseInput, canonicalKin
 		if errors.Is(err, k8s.ErrUnknownDynamicKind) {
 			return nil, nil, fmt.Errorf("%s (%s) is not installed or not yet discovered in this cluster — is %s running?", canonicalKind, group, tool)
 		}
-		return nil, nil, fmt.Errorf("resource not found: %w", err)
+		return nil, nil, notFoundError(ctx, err, canonicalKind, input.Namespace, input.Name)
 	}
 	minified, err := aicontext.Minify(u, aicontext.LevelDetail)
 	if err != nil {

@@ -108,6 +108,16 @@ export interface IssueRecentChange {
   change_category?: 'spec_config' | 'lifecycle' | 'runtime_status' | string;
   rank_reason?: string;
   fields?: IssueRecentChangeField[];
+  /** Workloads that mount/reference this ConfigMap directly ("Deployment/flagd").
+   *  Direct spec references only — runtime consumers via an intermediary
+   *  service are not captured. */
+  consumed_by?: string[];
+}
+
+/** "No tracked non-status changes in the window" — the claim is scoped by
+ *  window_seconds so a change just outside it can't be misread as absent. */
+export interface IssueNoRecentChanges {
+  window_seconds: number;
 }
 
 /**
@@ -185,6 +195,16 @@ export interface Issue {
   issue_timing?: 'started_at_resource_creation' | 'started_after_resource_was_healthy';
   /** The evidence that determined issue_timing (for auditability). */
   issue_timing_basis?: 'condition' | 'owner_condition' | 'pod_creation' | 'deletion' | 'phase' | 'spec';
+
+  /** Recent non-status changes (spec/config and lifecycle) on this issue's
+   *  subject (and, for workload subjects, its referenced ConfigMaps) —
+   *  deterministic evidence, not a causal claim. Populated only on
+   *  single-namespace MCP issue responses; never set on /api/issues today. */
+  correlated_changes?: IssueRecentChange[];
+  /** Explicit "no tracked changes in the window" evidence. An issue with
+   *  NEITHER correlation field was not checked — absence must not be read as
+   *  "no changes". MCP-only, like correlated_changes. */
+  no_recent_changes?: IssueNoRecentChanges;
 }
 
 /** subjectRef builds a deep-linkable ref for an issue's subject — the row's

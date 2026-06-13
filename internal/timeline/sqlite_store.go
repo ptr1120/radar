@@ -304,6 +304,18 @@ func (s *SQLiteStore) Query(ctx context.Context, opts QueryOptions) ([]TimelineE
 		query.WriteString(")")
 	}
 
+	if len(opts.Names) > 0 {
+		query.WriteString(" AND name IN (")
+		for i, name := range opts.Names {
+			if i > 0 {
+				query.WriteString(",")
+			}
+			query.WriteString("?")
+			args = append(args, name)
+		}
+		query.WriteString(")")
+	}
+
 	if !opts.Since.IsZero() {
 		query.WriteString(" AND timestamp >= ?")
 		args = append(args, opts.Since.Format(time.RFC3339Nano))
@@ -322,6 +334,18 @@ func (s *SQLiteStore) Query(ctx context.Context, opts QueryOptions) ([]TimelineE
 			}
 			query.WriteString("?")
 			args = append(args, string(src))
+		}
+		query.WriteString(")")
+	}
+
+	if len(opts.EventTypes) > 0 {
+		query.WriteString(" AND event_type IN (")
+		for i, et := range opts.EventTypes {
+			if i > 0 {
+				query.WriteString(",")
+			}
+			query.WriteString("?")
+			args = append(args, string(et))
 		}
 		query.WriteString(")")
 	}

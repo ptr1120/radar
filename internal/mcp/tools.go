@@ -113,11 +113,13 @@ func registerTools(server *mcp.Server) {
 			"scoped to a namespace. " +
 			"Returns Kubernetes resource nodes and edges (Services, workloads, Pods, " +
 			"Ingresses, ConfigMaps, Secrets, owners) so you can see service-to-workload " +
-			"traffic and ownership relationships instead of inspecting resources one by one. " +
+			"routing and ownership relationships instead of inspecting resources one by one. " +
 			"Use view=traffic for routing/connectivity questions and view=resources for " +
-			"ownership/deployment hierarchy. Always specify namespace unless you specifically " +
-			"need a cross-namespace graph. If you already know the suspicious root, use " +
-			"get_neighborhood for a smaller focused graph.",
+			"ownership/deployment hierarchy. NOTE: view=traffic is SPEC-DERIVED routing " +
+			"(Ingress→Service→Pod declarations) — it does not show observed traffic, " +
+			"request rates, or live connections. Always specify namespace unless you " +
+			"specifically need a cross-namespace graph. If you already know the suspicious " +
+			"root, use get_neighborhood for a smaller focused graph.",
 		Annotations: readOnly,
 	}, logToolCall("get_topology", handleGetTopology))
 
@@ -307,6 +309,14 @@ func registerTools(server *mcp.Server) {
 			"attached it. It lists recent spec/config changes that may explain failures " +
 			"not yet visible as runtime issues, or help distinguish creation-time " +
 			"baseline failures from the active incident. " +
+			"Single-namespace responses additionally correlate changes PER critical issue: " +
+			"`correlated_changes` lists recent non-status changes on that issue's subject " +
+			"(and its referenced ConfigMaps); `no_recent_changes.window_seconds` states the " +
+			"subject had NO tracked changes in that window — strong evidence the issue is " +
+			"chronic rather than change-driven. An issue with neither marker was not " +
+			"checked (see `correlation_truncated`) — never read absence as 'no changes'. " +
+			"ConfigMap change entries carry `consumed_by` (workloads that mount/reference " +
+			"them directly). " +
 			"For raw Kubernetes Warning events use get_events; for static best-practice / " +
 			"security-posture findings (runAsRoot, missing PDB, no probes, missing resource " +
 			"limits) use get_cluster_audit — a separate axis that must never be conflated (a " +
@@ -877,7 +887,7 @@ func handleGetResource(ctx context.Context, req *mcp.CallToolRequest, input getR
 	if group != "" && !k8s.TypedKindOwnsGroup(kind, group) {
 		u, dynErr := cache.GetDynamicWithGroup(ctx, kind, namespace, name, group)
 		if dynErr != nil {
-			return nil, nil, fmt.Errorf("resource not found: %w", dynErr)
+			return nil, nil, notFoundError(ctx, dynErr, kind, namespace, name)
 		}
 		resourceData = aicontext.MinifyUnstructured(u, aicontext.LevelDetail)
 		rawObj = u
@@ -886,12 +896,12 @@ func handleGetResource(ctx context.Context, req *mcp.CallToolRequest, input getR
 		if err == k8s.ErrUnknownKind {
 			u, dynErr := cache.GetDynamicWithGroup(ctx, kind, namespace, name, group)
 			if dynErr != nil {
-				return nil, nil, fmt.Errorf("resource not found: %w", dynErr)
+				return nil, nil, notFoundError(ctx, dynErr, kind, namespace, name)
 			}
 			resourceData = aicontext.MinifyUnstructured(u, aicontext.LevelDetail)
 			rawObj = u
 		} else if err != nil {
-			return nil, nil, fmt.Errorf("resource not found: %w", err)
+			return nil, nil, notFoundError(ctx, err, kind, namespace, name)
 		} else {
 			k8s.SetTypeMeta(obj)
 			minified, minErr := aicontext.Minify(obj, aicontext.LevelDetail)
@@ -901,6 +911,14 @@ func handleGetResource(ctx context.Context, req *mcp.CallToolRequest, input getR
 			resourceData = minified
 			rawObj = obj
 		}
+	}
+
+	// Large ConfigMaps are token bombs that make agents anchor on volume
+	// instead of signal — truncate oversized data values with an explicit
+	// note. Applied regardless of context mode.
+	var truncationNote string
+	if meaningfulchanges.ConfigMapKind(kind) {
+		resourceData, truncationNote = truncateLargeConfigMapData(resourceData)
 	}
 
 	// Build the resourceContext section unless the caller opted out. Basic
@@ -919,8 +937,14 @@ func handleGetResource(ctx context.Context, req *mcp.CallToolRequest, input getR
 		// State-derived advisory warnings (deletionTimestamp, external manager,
 		// terminating namespace, workload health-condition history, PVC stuck
 		// Pending). Cheap — operates on the object we already fetched. Skipped
-		// for context=none so that mode stays a bare object for raw jq work.
+		// for context=none so that mode stays a bare object for raw jq work;
+		// the ConfigMap truncation note appended below is the one warning that
+		// survives context=none, because silent truncation would read as a
+		// complete value.
 		warnings = k8score.EnrichRuntimeObjectWarnings(rawObj)
+	}
+	if truncationNote != "" {
+		warnings = append(warnings, truncationNote)
 	}
 
 	defaultConfigMapChanges := meaningfulchanges.ConfigMapKind(kind)
@@ -928,7 +952,7 @@ func handleGetResource(ctx context.Context, req *mcp.CallToolRequest, input getR
 	var recentChanges []issuesapi.RecentChange
 	var changesErr string
 	if includeChanges {
-		changes, err := meaningfulchanges.RecentForResource(ctx, kind, namespace, name, meaningfulchanges.DefaultSince, meaningfulchanges.ResourceLimit, meaningfulchanges.DefaultFieldLimit)
+		changes, _, err := meaningfulchanges.RecentForResource(ctx, kind, namespace, name, meaningfulchanges.DefaultSince, meaningfulchanges.ResourceLimit, meaningfulchanges.DefaultFieldLimit)
 		if err != nil {
 			changesErr = err.Error()
 		} else {
@@ -937,7 +961,8 @@ func handleGetResource(ctx context.Context, req *mcp.CallToolRequest, input getR
 	}
 
 	// Three shapes:
-	//   - bare resource: no includes, context=none
+	//   - bare resource: no includes, context=none, no warnings (a truncation
+	//     warning upgrades this to {resource, warnings})
 	//   - resource + resourceContext: no includes, default context
 	//   - resource + resourceContext + extras: includes set
 	if len(includes) == 0 && resourceCtx == nil && len(warnings) == 0 && !defaultConfigMapChanges {
@@ -1064,7 +1089,7 @@ func attachResourceExtras(ctx context.Context, cache *k8s.ResourceCache, result 
 		_, hasChanges := result["recentChanges"]
 		_, hasChangesErr := result["recentChangesError"]
 		if !hasChanges && !hasChangesErr {
-			if changes, err := meaningfulchanges.RecentForResource(ctx, kind, namespace, name, meaningfulchanges.DefaultSince, meaningfulchanges.ResourceLimit, meaningfulchanges.DefaultFieldLimit); err == nil {
+			if changes, _, err := meaningfulchanges.RecentForResource(ctx, kind, namespace, name, meaningfulchanges.DefaultSince, meaningfulchanges.ResourceLimit, meaningfulchanges.DefaultFieldLimit); err == nil {
 				result["recentChanges"] = changes
 			} else {
 				result["recentChangesError"] = err.Error()
@@ -1256,6 +1281,15 @@ func handleGetTopology(ctx context.Context, req *mcp.CallToolRequest, input topo
 		return toJSONResult(buildTopologySummary(topo))
 	}
 
+	// Steering for oversized graph responses — reuses the topology Warnings
+	// channel so the response shape stays stable.
+	const topologyGraphNodeHintThreshold = 300
+	if len(topo.Nodes) > topologyGraphNodeHintThreshold {
+		topo.Warnings = append(topo.Warnings, fmt.Sprintf(
+			"large graph (%d nodes) — scope with namespace=, use format=summary, or get_neighborhood around a suspect root",
+			len(topo.Nodes),
+		))
+	}
 	return toJSONResult(topo)
 }
 
@@ -2455,8 +2489,8 @@ func handleIssuesTool(ctx context.Context, _ *mcp.CallToolRequest, input issuesI
 		filters.Filter = f
 	}
 	out, stats := issues.ComposeWithStats(provider, filters)
-	// Shared response shape (issues.ListResponse) — identical to /api/issues so
-	// HTTP and MCP can't drift.
+	// Shared base response shape (issues.ListResponse), then MCP-specific
+	// enrichments below.
 	resp := issues.NewListResponse(out, stats)
 	resp.ClusterContext = provider.ClusterContextForIssues(allowedNamespaces, func(group, resource string) bool {
 		return canReadInNamespace(ctx, group, resource, "kube-system", "list")
@@ -2473,6 +2507,13 @@ func handleIssuesTool(ctx context.Context, _ *mcp.CallToolRequest, input issuesI
 				resp.RecentChangesReason = recentChangesReason
 			}
 		}
+	}
+	// Per-issue change correlation (single-namespace responses): each
+	// critical issue carries either its correlated non-status changes or an
+	// explicit no_recent_changes marker — deterministic per-subject evidence
+	// the global recent_changes list can't bind to individual issues.
+	if len(allowedNamespaces) == 1 {
+		attachIssueChangeCorrelation(ctx, &resp)
 	}
 	// Steering hint when the issue list was capped (MCP-only).
 	if stats.TotalMatched > len(out) {

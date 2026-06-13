@@ -235,6 +235,7 @@ func ResetResourceCache() {
 	}
 	cacheOnce = new(sync.Once)
 	initialSyncComplete = false
+	resetRecreateStash()
 }
 
 // recordK8sEventToTimeline records a K8s Event to the timeline store
@@ -392,6 +393,10 @@ func recordToTimelineStore(kind, namespace, name, uid, op string, oldObj, newObj
 		obj = oldObj
 	}
 
+	if op == "delete" {
+		stashDeletedForRecreate(kind, namespace, name, uid, obj)
+	}
+
 	owner := timeline.ExtractOwner(obj)
 	labels := timeline.ExtractLabels(obj)
 	healthState := timeline.DetermineHealthState(kind, obj)
@@ -448,6 +453,39 @@ func recordToTimelineStore(kind, namespace, name, uid, op string, oldObj, newObj
 		}
 	}
 
+	// Recreate-join: an add that replaces a just-deleted object of the same
+	// name but a different UID carries the diff against its predecessor, so
+	// the change feed can show what the recreate changed instead of a
+	// contentless delete+add pair. Guarded to young objects post-sync — the
+	// same conditions under which the add below is recorded at all.
+	//
+	// Status is stripped from BOTH sides before diffing: every recreate
+	// resets status, so cross-recreate status deltas (ready 1→0, condition
+	// flips) are tautological noise — and worse, a spec-identical recreate
+	// (namespace re-apply) would otherwise emit a status-only "recreated
+	// with changes" entry that reads as a config change.
+	recreated := false
+	if op == "add" && newObj != nil && initialSyncComplete {
+		if meta, ok := newObj.(metav1.Object); ok && time.Since(meta.GetCreationTimestamp().Time) <= 30*time.Second {
+			if stashed, ok := takeRecreateMatch(kind, namespace, name, uid); ok {
+				if localDiff := ComputeDiff(kind, stripStatusForRecreateDiff(stashed), stripStatusForRecreateDiff(newObj)); localDiff != nil && len(localDiff.Fields) > 0 {
+					diff = &timeline.DiffInfo{
+						Fields:  make([]timeline.FieldChange, len(localDiff.Fields)),
+						Summary: "recreated with changes: " + localDiff.Summary,
+					}
+					for i, f := range localDiff.Fields {
+						diff.Fields[i] = timeline.FieldChange{
+							Path:     f.Path,
+							OldValue: f.OldValue,
+							NewValue: f.NewValue,
+						}
+					}
+					recreated = true
+				}
+			}
+		}
+	}
+
 	event := timeline.NewInformerEvent(
 		kind, apiVersion, namespace, name, uid,
 		timeline.OperationToEventType(op),
@@ -458,6 +496,9 @@ func recordToTimelineStore(kind, namespace, name, uid, op string, oldObj, newObj
 		createdAt,
 	)
 	event.ClusterContext = ActiveClusterContext()
+	if recreated {
+		event.Reason = timeline.ReasonRecreated
+	}
 
 	var events []timeline.TimelineEvent
 	if op == "add" && newObj != nil {
