@@ -717,11 +717,10 @@ export function useCapabilities() {
   })
 }
 
-// Namespace-scoped capabilities: lazy re-check for exec/logs/portForward when
-// global RBAC checks denied them. Users with namespace-scoped RoleBindings may
+// Namespace-scoped capabilities. Users with namespace-scoped RoleBindings may
 // have these permissions in specific namespaces.
-export function useNamespaceCapabilities(namespace: string | undefined, globalCaps: Capabilities) {
-  const needsCheck = namespace && (!globalCaps.exec || !globalCaps.logs || !globalCaps.portForward)
+export function useNamespaceCapabilities(namespace: string | undefined, globalCaps: Capabilities | undefined) {
+  const needsCheck = namespace && globalCaps
   return useQuery<Capabilities>({
     queryKey: ['capabilities', namespace],
     queryFn: () => fetchJSON(`/capabilities?namespace=${encodeURIComponent(namespace!)}`),
@@ -1777,6 +1776,123 @@ export function useBulkDeleteResources() {
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ['resources'] })
       queryClient.invalidateQueries({ queryKey: ['resource-counts'] })
+      queryClient.invalidateQueries({ queryKey: ['topology'] })
+    },
+  })
+}
+
+interface BulkWorkloadItem {
+  kind: string
+  namespace: string
+  name: string
+}
+
+interface BulkWorkloadMutationResult {
+  requested: number
+  succeeded: number
+  failedMessages: string[]
+}
+
+function failedBulkWorkloadMessages(results: PromiseSettledResult<unknown>[]): string[] {
+  return results.flatMap(r => r.status === 'rejected'
+    ? [r.reason instanceof Error ? r.reason.message : String(r.reason)]
+    : []
+  )
+}
+
+function bulkWorkloadFailureMessage(action: string, failed: number, total: number, messages: string[]): string {
+  return `Failed to ${action} ${failed} of ${total} workloads:\n${messages.join('\n')}`
+}
+
+export function useBulkRestartWorkloads() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async ({ items }: { items: BulkWorkloadItem[] }): Promise<BulkWorkloadMutationResult> => {
+      if (items.length === 0) {
+        return { requested: 0, succeeded: 0, failedMessages: [] }
+      }
+      const results = await Promise.allSettled(
+        items.map(async ({ kind, namespace, name }) => {
+          const response = await apiFetch(`${getApiBase()}/workloads/${kind}/${namespace}/${name}/restart`, {
+            method: 'POST',
+          })
+          if (!response.ok) {
+            const error = await response.json().catch(() => ({ error: 'Unknown error' }))
+            throw new Error(`${namespace}/${name}: ${error.error || `HTTP ${response.status}`}`)
+          }
+          return { kind, namespace, name }
+        })
+      )
+      const failedMessages = failedBulkWorkloadMessages(results)
+      if (failedMessages.length === items.length) {
+        throw new Error(bulkWorkloadFailureMessage('restart', failedMessages.length, items.length, failedMessages))
+      }
+      return { requested: items.length, succeeded: items.length - failedMessages.length, failedMessages }
+    },
+    meta: {
+      errorMessage: 'Failed to restart some workloads',
+    },
+    onSuccess: (result) => {
+      if (result.failedMessages.length > 0) {
+        showApiError(
+          `Restarted ${result.succeeded} of ${result.requested} workloads`,
+          result.failedMessages.join('\n'),
+        )
+      } else {
+        showApiSuccess('Workloads restarting')
+      }
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['resources'] })
+      queryClient.invalidateQueries({ queryKey: ['topology'] })
+    },
+  })
+}
+
+export function useBulkScaleWorkloads() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async ({ items, replicas }: { items: BulkWorkloadItem[]; replicas: number }): Promise<BulkWorkloadMutationResult> => {
+      if (items.length === 0) {
+        return { requested: 0, succeeded: 0, failedMessages: [] }
+      }
+      const results = await Promise.allSettled(
+        items.map(async ({ kind, namespace, name }) => {
+          const response = await apiFetch(`${getApiBase()}/workloads/${kind}/${namespace}/${name}/scale`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ replicas }),
+          })
+          if (!response.ok) {
+            const error = await response.json().catch(() => ({ error: 'Unknown error' }))
+            throw new Error(`${namespace}/${name}: ${error.error || `HTTP ${response.status}`}`)
+          }
+          return { kind, namespace, name }
+        })
+      )
+      const failedMessages = failedBulkWorkloadMessages(results)
+      if (failedMessages.length === items.length) {
+        throw new Error(bulkWorkloadFailureMessage('scale', failedMessages.length, items.length, failedMessages))
+      }
+      return { requested: items.length, succeeded: items.length - failedMessages.length, failedMessages }
+    },
+    meta: {
+      errorMessage: 'Failed to scale some workloads',
+    },
+    onSuccess: (result) => {
+      if (result.failedMessages.length > 0) {
+        showApiError(
+          `Scaled ${result.succeeded} of ${result.requested} workloads`,
+          result.failedMessages.join('\n'),
+        )
+      } else {
+        showApiSuccess('Workloads scaled')
+      }
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['resources'] })
       queryClient.invalidateQueries({ queryKey: ['topology'] })
     },
   })

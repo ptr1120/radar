@@ -729,19 +729,20 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		caps.Username = user.Username
 	}
 
-	// Namespace-scoped re-check: when exec/logs/portForward are denied by the
-	// initial RBAC checks (cluster-wide + effective-namespace fallback), re-check
-	// scoped to the specific namespace the user is viewing. Users with
-	// namespace-scoped RoleBindings may have these permissions in namespaces
-	// other than the kubeconfig default.
+	// Namespace-scoped re-check for controls whose permission can differ by
+	// namespace. This keeps action visibility aligned with the namespace the
+	// user is viewing rather than only the kubeconfig default namespace.
 	if ns := r.URL.Query().Get("namespace"); ns != "" {
-		nsCaps, err := k8s.CheckNamespaceCapabilities(r.Context(), ns, caps)
+		var nsCaps *k8s.NamespaceCapabilities
+		if user := auth.UserFromContext(r.Context()); user != nil {
+			nsCaps, err = k8s.CheckNamespaceCapabilitiesForUser(r.Context(), user.Username, user.Groups, ns)
+		} else {
+			nsCaps, err = k8s.CheckNamespaceCapabilities(r.Context(), ns)
+		}
 		if err != nil {
 			log.Printf("[capabilities] namespace-scoped check for %q failed: %v", ns, err)
 		} else if nsCaps != nil {
-			caps.Exec = nsCaps.Exec
-			caps.Logs = nsCaps.Logs
-			caps.PortForward = nsCaps.PortForward
+			mergeNamespaceCapabilities(caps, nsCaps)
 		}
 	}
 
@@ -769,6 +770,27 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, caps)
+}
+
+func mergeNamespaceCapabilities(caps *k8s.Capabilities, nsCaps *k8s.NamespaceCapabilities) {
+	caps.Exec = mergeNamespaceCapability(caps.Exec, nsCaps.Exec, nsCaps.Errors.Exec)
+	caps.Logs = mergeNamespaceCapability(caps.Logs, nsCaps.Logs, nsCaps.Errors.Logs)
+	caps.PortForward = mergeNamespaceCapability(caps.PortForward, nsCaps.PortForward, nsCaps.Errors.PortForward)
+	caps.WorkloadWrites.Deployments = mergeNamespaceCapability(caps.WorkloadWrites.Deployments, nsCaps.WorkloadWrites.Deployments, nsCaps.Errors.WorkloadWrites.Deployments)
+	caps.WorkloadWrites.DaemonSets = mergeNamespaceCapability(caps.WorkloadWrites.DaemonSets, nsCaps.WorkloadWrites.DaemonSets, nsCaps.Errors.WorkloadWrites.DaemonSets)
+	caps.WorkloadWrites.StatefulSets = mergeNamespaceCapability(caps.WorkloadWrites.StatefulSets, nsCaps.WorkloadWrites.StatefulSets, nsCaps.Errors.WorkloadWrites.StatefulSets)
+	caps.WorkloadWrites.Rollouts = mergeNamespaceCapability(caps.WorkloadWrites.Rollouts, nsCaps.WorkloadWrites.Rollouts, nsCaps.Errors.WorkloadWrites.Rollouts)
+}
+
+func mergeNamespaceCapability(global, namespaced, checkErrored bool) bool {
+	if checkErrored {
+		return global || namespaced
+	}
+	// A clean namespace result is authoritative: global may have come from
+	// the effective-namespace fallback and must not bleed into a different
+	// namespace. On API errors, keep any existing grant so transient SAR
+	// failures do not revoke controls.
+	return namespaced
 }
 
 // parseNamespacesForUser parses namespace query params and filters by user permissions.

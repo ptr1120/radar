@@ -1,17 +1,20 @@
 import { useState, useMemo, useCallback, useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { ApiError, debugNamespaceLog, fetchJSON, isForbiddenError, useSecretCertExpiry, useTopPodMetrics, useTopNodeMetrics, useBulkDeleteResources } from '../../api/client'
+import { ApiError, debugNamespaceLog, fetchJSON, isForbiddenError, useCapabilities, useNamespaceCapabilities, useSecretCertExpiry, useTopPodMetrics, useTopNodeMetrics, useBulkDeleteResources, useBulkRestartWorkloads, useBulkScaleWorkloads } from '../../api/client'
 import { apiUrl, getAuthHeaders, getCredentialsMode, getBasename } from '../../api/config'
 import { useAPIResources } from '../../api/apiResources'
 import { initNavigationMap } from '@skyhook-io/k8s-ui'
 import { usePinnedKinds } from '../../hooks/useFavorites'
 import { useOpenLogs, useOpenWorkloadLogs } from '../dock'
 import {
+  canBulkRestartKind,
+  canBulkScaleKind,
   ResourcesView as BaseResourcesView,
   CORE_RESOURCES,
+  intersectWorkloadWrites,
 } from '@skyhook-io/k8s-ui'
-import type { ResourceQueryResult } from '@skyhook-io/k8s-ui'
+import type { Capabilities, ResourceQueryResult, WorkloadWritePermissions } from '@skyhook-io/k8s-ui'
 import type { SelectedResource } from '../../types'
 import { kindToPlural, type NavigateToResource } from '../../utils/navigation'
 import { CreateResourceDialog } from '../shared/CreateResourceDialog'
@@ -31,9 +34,44 @@ interface ResourcesViewProps {
   onClearNamespaces?: () => void
 }
 
+type SelectedKindInfo = { name: string; kind: string; group: string } | null
+
+const deniedWorkloadWrites: WorkloadWritePermissions = {
+  deployments: false,
+  daemonSets: false,
+  statefulSets: false,
+  rollouts: false,
+}
+
 export function ResourcesView({ namespaces, selectedResource, onResourceClick, onResourceClickYaml, onKindChange, onClearNamespaces }: ResourcesViewProps) {
   const location = useLocation()
   const navigate = useNavigate()
+
+  const { data: capabilities } = useCapabilities()
+  const namespaceForCapabilities = namespaces.length === 1 ? namespaces[0] : undefined
+  const { data: namespaceCapabilities } = useNamespaceCapabilities(namespaceForCapabilities, capabilities)
+  const namespaceCapabilityNames = useMemo(() => namespaces.length > 1 ? [...namespaces].sort() : [], [namespaces])
+  const { data: namespaceCapabilitiesList } = useQuery<Array<Pick<Capabilities, 'workloadWrites'>>>({
+    queryKey: ['capabilities', 'namespaces', namespaceCapabilityNames],
+    queryFn: async () => {
+      const results = await Promise.allSettled(
+        namespaceCapabilityNames.map(async ns => ({
+          namespace: ns,
+          capabilities: await fetchJSON<Capabilities>(`/capabilities?namespace=${encodeURIComponent(ns)}`),
+        }))
+      )
+      return results.map((result, index) => {
+        if (result.status === 'fulfilled') {
+          return { workloadWrites: result.value.capabilities.workloadWrites }
+        }
+        console.warn(`Failed to fetch namespace capabilities for ${namespaceCapabilityNames[index]}, withholding workload writes:`, result.reason)
+        return { workloadWrites: deniedWorkloadWrites }
+      })
+    },
+    enabled: namespaceCapabilityNames.length > 1 && capabilities != null,
+    staleTime: 60000,
+  })
+  const multiNamespaceWorkloadWrites = useMemo(() => intersectWorkloadWrites(namespaceCapabilitiesList), [namespaceCapabilitiesList])
 
   // API resources discovery
   const { data: apiResources } = useAPIResources()
@@ -44,7 +82,14 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
   }, [apiResources])
 
   // Track the selected kind from the k8s-ui component
-  const [selectedKind, setSelectedKind] = useState<{ name: string; kind: string; group: string } | null>(null)
+  const [selectedKind, setSelectedKind] = useState<SelectedKindInfo>(null)
+  const workloadWrites = namespaces.length === 0
+    ? capabilities?.workloadWrites
+    : namespaces.length === 1
+      ? namespaceCapabilities?.workloadWrites
+      : multiNamespaceWorkloadWrites
+  const canBulkRestartSelectedKind = useMemo(() => canBulkRestartKind(selectedKind, workloadWrites), [selectedKind, workloadWrites])
+  const canBulkScaleSelectedKind = useMemo(() => canBulkScaleKind(selectedKind, workloadWrites), [selectedKind, workloadWrites])
 
   // Lightweight resource counts for sidebar badges (~2KB instead of ~608MB)
   const namespacesParam = namespaces.join(',')
@@ -148,6 +193,8 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
 
   // Bulk delete
   const bulkDeleteMutation = useBulkDeleteResources()
+  const bulkRestartMutation = useBulkRestartWorkloads()
+  const bulkScaleMutation = useBulkScaleWorkloads()
 
   // Navigation adapter. k8s-ui constructs paths from `basePath` (which
   // includes the router basename so they line up with window.location.pathname
@@ -230,6 +277,10 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
       // Bulk operations
       onBulkDelete={(items, options) => bulkDeleteMutation.mutate({ items, force: options?.force }, { onSuccess: options?.onSuccess })}
       isBulkDeleting={bulkDeleteMutation.isPending}
+      onBulkRestart={canBulkRestartSelectedKind ? (items, options) => bulkRestartMutation.mutate({ items }, { onSuccess: options?.onSuccess }) : undefined}
+      isBulkRestarting={canBulkRestartSelectedKind && bulkRestartMutation.isPending}
+      onBulkScale={canBulkScaleSelectedKind ? (items, replicas, options) => bulkScaleMutation.mutate({ items, replicas }, { onSuccess: options?.onSuccess }) : undefined}
+      isBulkScaling={canBulkScaleSelectedKind && bulkScaleMutation.isPending}
     />
     <CreateResourceDialog
       open={createDialogOpen}
