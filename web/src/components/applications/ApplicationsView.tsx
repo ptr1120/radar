@@ -4,6 +4,7 @@ import {
   ApplicationsList,
   ApplicationDetail,
   CenteredEmpty,
+  PageHeader,
   useToast,
   orderEnvs,
   matchWorkloadAcrossInstances,
@@ -65,26 +66,33 @@ export function ApplicationsView({ namespaces, onOpenResource }: ApplicationsVie
     return <AppDetailRoute app={selected} apps={apps} onBack={() => selectApp(null)} onOpenResource={onOpenResource} />
   }
 
-  return (
-    <div className="flex-1 overflow-auto px-4 py-4 sm:px-6">
-      <header className="mb-4 flex flex-col gap-1">
-        <h1 className="text-xl font-semibold text-theme-text-primary">Applications</h1>
-        <p className="max-w-3xl text-sm text-theme-text-secondary">Deployable software in this cluster — your services, workers, and jobs, grouped by app/release evidence.</p>
-      </header>
+  // The header + status + filters + table chassis lives inside ApplicationsList
+  // (mirroring GitOpsTableView), which renders only on the data path. To keep
+  // the page header from vanishing while loading / on error, the wrapper shows
+  // the same header bar above those states. (Keep title + description in sync
+  // with ApplicationsList's PageHeader.)
+  if (query.isLoading || query.error) {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div className="shrink-0 border-b border-theme-border px-4 py-4">
+          <PageHeader
+            icon={Boxes}
+            title="Applications"
+            description="Deployable software in this cluster — your services, workers, and jobs, grouped by app/release evidence."
+          />
+        </div>
+        {query.isLoading ? (
+          <CenteredEmpty icon={Boxes} headline="Loading applications…" />
+        ) : (
+          <CenteredEmpty tone="filtered" icon={Boxes} headline="Failed to load applications" body={(query.error as Error).message} />
+        )}
+      </div>
+    )
+  }
 
-      {query.isLoading ? (
-        <CenteredEmpty icon={Boxes} headline="Loading applications…" />
-      ) : query.error ? (
-        <CenteredEmpty tone="filtered" icon={Boxes} headline="Failed to load applications" body={(query.error as Error).message} />
-      ) : apps.length === 0 ? (
-        <CenteredEmpty
-          icon={Boxes}
-          headline="No applications detected yet"
-          body="Deploy services, workers, or jobs to this cluster to see them grouped by app."
-        />
-      ) : (
-        <ApplicationsList apps={apps} onSelect={selectApp} />
-      )}
+  return (
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <ApplicationsList apps={apps} onSelect={selectApp} />
     </div>
   )
 }

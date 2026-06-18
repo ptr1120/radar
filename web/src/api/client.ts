@@ -90,8 +90,8 @@ export function isForbiddenError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 403
 }
 
-export async function fetchJSON<T>(path: string): Promise<T> {
-  const response = await apiFetch(`${getApiBase()}${path}`)
+export async function fetchJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const response = await apiFetch(`${getApiBase()}${path}`, signal ? { signal } : undefined)
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({ error: 'Unknown error' }))
     throw new ApiError(errorData.error || `HTTP ${response.status}`, response.status, errorData)
@@ -689,6 +689,68 @@ export interface RuntimeStats {
   uptimeSeconds: number
   typedInformers?: number
   dynamicInformers?: number
+}
+
+// ============================================================================
+// Resource search (GET /api/search) — the existing search engine, RBAC-filtered
+// and ranked server-side. Mirrors internal/search.Hit / .Result.
+// ============================================================================
+
+export interface SearchMatchedField {
+  token: string
+  /** "name" | "namespace" | "label:k" | "annotation:k" | "image" | "kind" | "content:path" */
+  site: string
+  score: number
+}
+
+export interface SearchSummaryContext {
+  health?: string
+  issueCount?: number
+  managedBy?: { kind?: string; name?: string } | null
+}
+
+export interface SearchHit {
+  score: number
+  kind: string
+  group?: string
+  namespace?: string
+  name: string
+  matched?: SearchMatchedField[]
+  summaryContext?: SearchSummaryContext
+}
+
+export interface SearchResult {
+  hits: SearchHit[]
+  total: number
+  searched: number
+  total_matched: number
+}
+
+const SEARCH_MIN_QUERY = 2
+
+// useSearch hits the resource-search engine. The caller supplies the (already
+// debounced) query; the hook is enabled only past the min length. include=none
+// keeps the per-hit payload identity-only; context=summary attaches
+// health/issueCount per hit (rich rows). React Query's AbortSignal cancels
+// overlapping scans on a new query. keepPreviousData avoids flicker while the
+// next query resolves.
+export function useSearch(query: string, opts?: { limit?: number; context?: 'summary' | 'none'; enabled?: boolean; globalNs?: boolean }) {
+  const trimmed = query.trim()
+  const enabled = (opts?.enabled ?? true) && trimmed.length >= SEARCH_MIN_QUERY
+  const limit = opts?.limit ?? 20
+  const context = opts?.context ?? 'summary'
+  // globalNs makes search ignore the per-user namespace-switcher pick and scan
+  // the user's full RBAC ceiling (scope then comes only from the query's `ns:`
+  // tokens). The omnibar opts in so ⌘K is a genuinely global lookup.
+  const globalNs = opts?.globalNs ?? false
+  return useQuery<SearchResult>({
+    queryKey: ['search', trimmed, limit, context, globalNs],
+    queryFn: ({ signal }) =>
+      fetchJSON<SearchResult>(`/search?q=${encodeURIComponent(trimmed)}&limit=${limit}&include=none&context=${context}${globalNs ? '&globalNs=1' : ''}`, signal),
+    enabled,
+    staleTime: 2000,
+    placeholderData: (prev) => prev, // keepPreviousData
+  })
 }
 
 export interface HealthResponse {

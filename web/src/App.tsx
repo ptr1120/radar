@@ -7,6 +7,8 @@ import { useNavigate, useLocation, useSearchParams, useNavigationType, Navigatio
 import { HomeView } from './components/home/HomeView'
 import { DebugOverlay } from './components/DebugOverlay'
 import { TopologyGraph, TopologySearch, TopologyFilterSidebar, TopologyControls, gitOpsRouteForKind, gitOpsRouteForResource } from '@skyhook-io/k8s-ui'
+import { initNavigationMap } from '@skyhook-io/k8s-ui/utils/navigation'
+import { useAPIResources } from './api/apiResources'
 import { TimelineView } from './components/timeline/TimelineView'
 import { ResourcesView } from './components/resources/ResourcesView'
 import { serializeColumnFilters } from './components/resources/resource-utils'
@@ -27,6 +29,9 @@ import { DURATION_DOCK } from '@skyhook-io/k8s-ui/utils/animation'
 import { ContextSwitcher } from './components/ContextSwitcher'
 import { NamespaceSwitcher, type NamespaceSwitcherHandle } from './components/NamespaceSwitcher'
 import { useNavCustomization } from './context/NavCustomization'
+import { PrimaryNavRail } from './components/nav/PrimaryNavRail'
+import { useNavRailPinned } from './hooks/useNavRailPinned'
+import { useMediaQuery } from './hooks/useMediaQuery'
 import { ContextSwitchProvider, useContextSwitch } from './context/ContextSwitchContext'
 import { ConnectionProvider, useConnection } from './context/ConnectionContext'
 import { ConnectionErrorView } from './components/ConnectionErrorView'
@@ -43,14 +48,15 @@ import { routePath, apiUrl, getAuthHeaders, getCredentialsMode } from './api/con
 import { KeyboardShortcutProvider, useRegisterShortcut, useRegisterShortcuts } from './hooks/useKeyboardShortcuts'
 import { useAnimatedUnmount } from './hooks/useAnimatedUnmount'
 import radarLoadingIcon from '@skyhook-io/k8s-ui/assets/radar/radar-icon-loading.svg'
-import { RefreshCw, Network, List, Clock, Package, Sun, Moon, Activity, Home, Star, Search, Bug, Settings, SquareTerminal, ShieldCheck, GitBranch } from 'lucide-react'
+import { RefreshCw, Network, List, Clock, Package, Sun, Moon, Activity, Home, Star, Search, Bug, SquareTerminal, ShieldCheck, GitBranch, HelpCircle } from 'lucide-react'
 import { useTheme } from './context/ThemeContext'
 import { Tooltip } from './components/ui/Tooltip'
 import { LargeClusterNamespacePicker } from './components/shared/LargeClusterNamespacePicker'
 import { SettingsDialog } from './components/settings/SettingsDialog'
 import { MyPermissionsDialog } from './components/settings/MyPermissionsDialog'
 import type { TopologyNode, GroupingMode, MainView, SelectedResource, SelectedHelmRelease, NodeKind, TopologyMode, Topology, K8sEvent } from './types'
-import { kindToPlural, openExternal, apiVersionToGroup, buildWorkloadPath } from './utils/navigation'
+import { kindToPlural, openExternal, apiVersionToGroup, buildWorkloadPath, searchHitToSelectedResource } from './utils/navigation'
+import { Omnibar, type OmnibarHandle } from './components/ui/Omnibar'
 import type { ContextSwitcherHandle } from './components/ContextSwitcher'
 
 // All possible node kinds (core + GitOps)
@@ -94,7 +100,7 @@ const FLEET_MODE_KINDS = new Set<NodeKind>([
 
 // Convert API resource name back to topology node ID prefix
 // Extended MainView type that includes traffic and cost
-type ExtendedMainView = MainView | 'traffic' | 'cost' | 'workload' | 'audit' | 'gitops' | 'compare' | 'issues' | 'applications'
+type ExtendedMainView = MainView | 'traffic' | 'cost' | 'workload' | 'checks' | 'gitops' | 'compare' | 'issues' | 'applications'
 
 // Extract view from URL path
 function getViewFromPath(pathname: string): ExtendedMainView {
@@ -107,7 +113,7 @@ function getViewFromPath(pathname: string): ExtendedMainView {
   if (path === 'traffic') return 'traffic'
   if (path === 'cost') return 'cost'
   if (path === 'workload') return 'workload'
-  if (path === 'audit') return 'audit'
+  if (path === 'checks' || path === 'audit') return 'checks'  // /audit = legacy → checks
   if (path === 'gitops') return 'gitops'
   if (path === 'applications') return 'applications'
   if (path === 'compare') return 'compare'
@@ -171,6 +177,24 @@ function AppInner() {
   const capabilities = useCapabilitiesContext()
   const openLocalTerminal = useOpenLocalTerminal()
   const navCustomization = useNavCustomization()
+  const { pinned: navRailPinned, togglePinned: toggleNavRailPinned } = useNavRailPinned()
+  // Standalone Radar gets the left nav rail; embedded hosts (Radar Hub) own
+  // the left chrome via their own fleet rail and keep Radar's top-bar pills.
+  const showNavRail = !navCustomization.embedded
+  // Chromeless embed: the host (Radar Hub) owns ALL chrome and drives view
+  // navigation + scope from its own UI, so Radar renders just the active view's
+  // content — no top bar, no view-switcher. Used for per-cluster views surfaced
+  // as native cloud destinations behind a cluster picker.
+  const chromeless = navCustomization.embedded === true && navCustomization.chrome === 'none'
+  // Force the slim rail on narrow windows: a pinned 176px rail needs viewport
+  // ≥976 to keep content above its ~800px floor (collapsed needs only ≥856).
+  // Below 976 we render collapsed regardless of the pin preference — a
+  // temporary responsive override that does NOT touch the persisted value, so
+  // the user's pinned state returns when they widen again. Fly-out labels cover
+  // the collapsed state, so the manual toggle is hidden here rather than left
+  // inert (expanding would just re-breach the floor).
+  const railForcedSlim = useMediaQuery('(max-width: 975px)')
+  const navRailEffectivePinned = navRailPinned && !railForcedSlim
 
   // Auth check — detect if auth is enabled but user is not authenticated
   const { data: authMe, isPending: authMePending } = useAuthMe()
@@ -262,7 +286,7 @@ function AppInner() {
   // unaffected and renders the in-app audit view as before.
   const clusterChecksHref = navCustomization.clusterChecksHref
   useEffect(() => {
-    if (clusterChecksHref && mainView === 'audit') {
+    if (clusterChecksHref && mainView === 'checks') {
       window.location.replace(clusterChecksHref())
     }
   }, [clusterChecksHref, mainView])
@@ -450,14 +474,38 @@ function AppInner() {
 
   // Refs for dropdown components to trigger them via shortcuts
   const namespaceSwitcherRef = useRef<NamespaceSwitcherHandle>(null)
+  const omnibarRef = useRef<OmnibarHandle>(null)
+
+  // Initialize the kind→plural discovery map app-wide (not just on ResourcesView
+  // mount) so the omnibar can open a CRD hit with an irregular plural from any
+  // view — kindToPlural would otherwise English-guess the route before a
+  // resources view has run n().
+  const { data: navApiResources } = useAPIResources()
+  useEffect(() => { if (navApiResources) initNavigationMap(navApiResources) }, [navApiResources])
   const contextSwitcherRef = useRef<ContextSwitcherHandle>(null)
 
   // View switching keyboard shortcuts
-  const views: ExtendedMainView[] = ['home', 'topology', 'resources', 'timeline', 'helm', 'gitops', 'applications', 'traffic', 'cost', 'audit']
+  // `g`+mnemonic sequences cover every view. Numeric 1–N can't: there are 11
+  // views and only 9 single digits, so `10`/`11` never match a keypress (a
+  // KeyboardEvent.key is one character). `g`-prefixed mnemonics scale, are the
+  // GitHub/Linear convention, and their second keys are all distinct (no clash
+  // with the scoped `g g` table shortcut). The letters are fixed regardless of
+  // position, so reordering the rail never changes a shortcut.
+  const VIEW_SHORTCUT_KEYS: Record<ExtendedMainView, string> = {
+    home: 'g h', resources: 'g r', issues: 'g i', topology: 'g t',
+    applications: 'g a', timeline: 'g l', traffic: 'g f', helm: 'g m',
+    gitops: 'g o', checks: 'g u', cost: 'g c',
+    // Non-rail views (reachable via deep links / actions, not the rail) get no
+    // dedicated mnemonic — listed for exhaustiveness so the type stays total.
+    workload: '', compare: '',
+  }
+  const views = Object.keys(VIEW_SHORTCUT_KEYS).filter(
+    (v): v is ExtendedMainView => VIEW_SHORTCUT_KEYS[v as ExtendedMainView] !== '',
+  )
   useRegisterShortcuts([
-    ...views.map((view, i) => ({
+    ...views.map((view) => ({
       id: `view-${view}`,
-      keys: String(i + 1),
+      keys: VIEW_SHORTCUT_KEYS[view],
       description: `Go to ${view.charAt(0).toUpperCase() + view.slice(1)}`,
       category: 'Navigation' as const,
       scope: 'global' as const,
@@ -498,11 +546,12 @@ function AppInner() {
     {
       id: 'command-palette',
       keys: 'Cmd+k',
-      description: 'Open command palette',
+      description: 'Search resources & commands',
       category: 'General' as const,
       scope: 'global' as const,
       allowInInputs: true,
-      handler: () => setShowCommandPalette(true),
+      // Standalone focuses the top-center omnibar; embedded opens the modal.
+      handler: () => { if (showNavRail) omnibarRef.current?.focus(); else setShowCommandPalette(true) },
     },
     {
       id: 'diagnostics',
@@ -513,6 +562,20 @@ function AppInner() {
       allowInInputs: true,
       handler: () => setShowDiagnostics(prev => !prev),
     },
+    // Settings exposes local-binary controls that don't apply to embedded hosts.
+    // Register the shortcut only when standalone (matching the gear button) —
+    // `enabled: false` would still list it in the `?` help overlay, which shows
+    // all registered shortcuts regardless of enabled state.
+    ...(showNavRail
+      ? [{
+          id: 'open-settings',
+          keys: 'g s',
+          description: 'Open settings',
+          category: 'General' as const,
+          scope: 'global' as const,
+          handler: () => setShowSettings(true),
+        }]
+      : []),
   ])
 
   // Separate registration for help-close — its `enabled` changes with showHelp,
@@ -1141,12 +1204,38 @@ function AppInner() {
 
   return (
     <PortForwardProvider>
-    <div className="relative flex flex-col h-screen bg-theme-base min-w-[800px]">
-      {/* Header */}
+    {/* Preserve the ~800px content floor: the rail is a fixed-width sibling, so
+        the outer minimum must include it (176px pinned / 56px collapsed) or the
+        content column (min-w-0, shrinkable) would fall below the old desktop
+        floor at small windows. Embedded mode has no rail → plain 800. */}
+    <div
+      className="relative flex h-screen bg-theme-base"
+      style={{ minWidth: 800 + (showNavRail ? (navRailEffectivePinned ? 176 : 56) : 0) }}
+    >
+      {showNavRail && (
+        <PrimaryNavRail
+          activeView={mainView}
+          onNavigate={setMainView}
+          pinned={navRailEffectivePinned}
+          onTogglePinned={toggleNavRailPinned}
+          showPinToggle={!railForcedSlim}
+          onOpenSettings={() => setShowSettings(true)}
+          accountSlot={<UserMenu variant="rail" pinned={navRailEffectivePinned} />}
+        />
+      )}
+      {/* `relative` makes this column the containing block for the absolute
+          overlays it hosts (BottomDock, expanded ResourceDetailDrawer) so they
+          span the content area AFTER the rail rather than the full viewport
+          under it. `fixed` splashes (connecting/switching) are unaffected. */}
+      <div className="relative flex flex-col flex-1 min-w-0 h-full">
+      {/* Header — suppressed in chromeless embed; the host owns the chrome. */}
+      {!chromeless && (
       <header className="relative z-50 flex items-center justify-between px-4 py-2 bg-theme-base/90 backdrop-blur-sm border-b border-theme-border/50">
         {/* Left: Logo + Cluster info */}
         <div className="flex items-center gap-4 shrink-0">
-          {navCustomization.brandSlot ?? <Logo />}
+          {/* Standalone rail owns the brand; only the embedded/pill layout
+              shows it in the header (host may override via brandSlot). */}
+          {navCustomization.brandSlot ?? (showNavRail ? null : <Logo />)}
 
           <div className="flex items-center gap-2">
             {navCustomization.contextSlot ?? <ContextSwitcher ref={contextSwitcherRef} />}
@@ -1200,7 +1289,10 @@ function AppInner() {
           </div>
         </div>
 
-        {/* Center: View tabs — absolute centered on wide, flows after left section on narrow */}
+        {/* Center: View tabs — embedded/pill layout only. Standalone Radar
+            navigates via the left rail (showNavRail), so the pill bar is
+            suppressed there to avoid a duplicate primary nav. */}
+        {!showNavRail && (
         <div className="md:absolute md:left-1/2 md:-translate-x-1/2 flex items-center gap-0.5 bg-theme-elevated/50 rounded-full p-1 ml-2 md:ml-0">
           {([
             { view: 'home' as const, icon: Home, label: 'Home' },
@@ -1217,7 +1309,7 @@ function AppInner() {
             // Cost is intentionally hidden from the pill bar for now — the view still
             // exists and is reachable via /cost, the Home dashboard card, and the
             // command palette (⌘K). Remove this comment to restore it.
-            { view: 'audit' as const, icon: ShieldCheck, label: 'Audit' },
+            { view: 'checks' as const, icon: ShieldCheck, label: 'Checks' },
           ] as const)
             // In Cloud, Checks is a fleet-scoped feature owned by the host's
             // left rail; the per-cluster view is just that fleet queue filtered
@@ -1227,7 +1319,7 @@ function AppInner() {
             // via the Home "Cluster Audit" card (→ /audit, redirected to the
             // scoped fleet Checks by the clusterChecksHref effect above), ⌘K,
             // and bookmarks. Standalone OSS keeps the Audit tab.
-            .filter(({ view }) => !(view === 'audit' && clusterChecksHref))
+            .filter(({ view }) => !(view === 'checks' && clusterChecksHref))
             .map(({ view, icon: Icon, label }) => (
             <Tooltip key={view} content={label} delay={100} position="bottom">
               <button
@@ -1254,6 +1346,30 @@ function AppInner() {
             </Tooltip>
           ))}
         </div>
+        )}
+
+        {/* Center: omnibar — standalone search + command surface (the ⌘K entry).
+            Fills the space the pill bar left; embedded keeps the pills + modal. */}
+        {showNavRail && (
+          <div className="hidden sm:flex flex-1 justify-center min-w-0 px-3">
+            <Omnibar
+              ref={omnibarRef}
+              onNavigateView={(view) => setMainView(view)}
+              onNavigateKind={(kind, group) => {
+                const params = new URLSearchParams(searchParams)
+                params.delete('kind')
+                if (group) params.set('apiGroup', group); else params.delete('apiGroup')
+                params.delete('resource')
+                navigate({ pathname: `/resources/${kind}`, search: params.toString() })
+              }}
+              onSwitchContext={(name) => switchContext.mutate({ name }, { onSettled: () => setNamespaces([]) })}
+              onSetNamespaces={(ns) => { setNamespaces(ns); setActiveNamespace.mutate({ namespaces: ns }) }}
+              onToggleTheme={toggleTheme}
+              onShowDiagnostics={() => setShowDiagnostics(true)}
+              onOpenResource={(hit) => navigateToResourceList(searchHitToSelectedResource(hit))}
+            />
+          </div>
+        )}
 
         {/* Right: Controls */}
         <div className="flex items-center gap-3 shrink-0">
@@ -1264,7 +1380,9 @@ function AppInner() {
           />
 
 
-          {/* Command palette trigger */}
+          {/* Command palette trigger — embedded only; standalone has the
+              top-center omnibar (which is the ⌘K surface). */}
+          {!showNavRail && (
           <button
             onClick={() => setShowCommandPalette(true)}
             className="hidden lg:flex items-center gap-2 h-7 px-2.5 rounded-md bg-theme-elevated hover:bg-theme-hover text-theme-text-secondary hover:text-theme-text-primary transition-colors"
@@ -1274,6 +1392,7 @@ function AppInner() {
               {typeof navigator !== 'undefined' && navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}K
             </kbd>
           </button>
+          )}
 
           {/* GitHub star — hidden in embedded mode (not OSS-distribution chrome). */}
           {!navCustomization.embedded && (
@@ -1305,33 +1424,37 @@ function AppInner() {
             </div>
           )}
 
-          {/* Settings — hidden in embedded mode. The standalone dialog
-              exposes local-binary controls (kubeconfig paths, server port,
-              "open browser on start", "Stop and restart the radar command
-              to apply") that don't apply to a hosted user who doesn't SSH
-              into the cluster. The audit view still opens the dialog via
-              its "N namespaces hidden" link for the narrow audit-ignores
-              setting — that's a deliberate escape hatch, not a general
-              surface. */}
-          {!navCustomization.embedded && (
-            <button
-              onClick={() => setShowSettings(true)}
-              className="p-1.5 rounded-md bg-theme-elevated hover:bg-theme-hover text-theme-text-secondary hover:text-theme-text-primary transition-colors"
-              title="Settings"
-            >
-              <Settings className="w-4 h-4" />
-            </button>
+          {/* Help + Report-a-bug — standalone only (the left rail owns chrome;
+              embedded hosts provide their own help/support). These replace the
+              old floating bottom-right pair. Settings moved to the rail bottom. */}
+          {showNavRail && (
+            <>
+              <button
+                onClick={() => setShowHelp(true)}
+                className="p-1.5 rounded-md bg-theme-elevated hover:bg-theme-hover text-theme-text-secondary hover:text-theme-text-primary transition-colors"
+                title="Keyboard shortcuts (?)"
+              >
+                <HelpCircle className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => setShowDiagnostics(true)}
+                className="p-1.5 rounded-md bg-theme-elevated hover:bg-theme-hover text-theme-text-secondary hover:text-theme-text-primary transition-colors"
+                title="Report a bug / Diagnostics"
+              >
+                <Bug className="w-4 h-4" />
+              </button>
+            </>
           )}
 
-          {/* User menu (when auth enabled) — hidden in embedded mode;
-              host app typically provides its own via rightExtras. */}
-          {!navCustomization.embedded && <UserMenu />}
+          {/* Account moved to the rail bottom (standalone). Embedded never showed
+              Radar's UserMenu — the host provides its own via rightExtras. */}
 
           {/* Consumer-provided extras (e.g. Radar Hub's Install button +
               avatar menu) appended to the right of the action bar. */}
           {navCustomization.rightExtras}
         </div>
       </header>
+      )}
 
       {/* Auth barrier - show when auth is enabled but user is not authenticated */}
       {authMe?.authEnabled && !authMe?.username && authMe.authMode === 'proxy' && (
@@ -1684,16 +1807,15 @@ function AppInner() {
             fleet Checks queue (clusterChecksHref effect above) — render a brief
             splash instead of the single-cluster view while the cross-document
             nav lands. */}
-        {mainView === 'audit' && clusterChecksHref && (
+        {mainView === 'checks' && clusterChecksHref && (
           <div className="flex-1 flex flex-col items-center justify-center gap-3 bg-theme-base">
             <img src={radarLoadingIcon} alt="" aria-hidden className="w-11 h-11" />
             <p className="text-sm text-theme-text-secondary">Opening Checks…</p>
           </div>
         )}
-        {mainView === 'audit' && !clusterChecksHref && (
+        {mainView === 'checks' && !clusterChecksHref && (
           <AuditView
             namespaces={namespaces}
-            onBack={() => setMainView('home')}
             onNavigateToResource={navigateToResourceList}
           />
         )}
@@ -1705,7 +1827,6 @@ function AppInner() {
         {mainView === 'issues' && (
           <IssuesPane
             namespaces={namespaces}
-            onBack={() => setMainView('home')}
             onNavigateToResource={navigateFromIssue}
           />
         )}
@@ -1783,8 +1904,12 @@ function AppInner() {
       {/* Spacer for dock */}
       <DockSpacer />
 
-      {/* Floating action buttons — bottom-right, above dock */}
-      <FloatingButtons showHelp={showHelp} showCommandPalette={showCommandPalette} showDiagnostics={showDiagnostics} onHelp={() => setShowHelp(true)} onBugReport={() => setShowDiagnostics(true)} />
+      {/* Floating action buttons — embedded only, and not in chromeless (the
+          host owns help/diagnostics chrome). Standalone moved help + bug to
+          visible top-bar icons (the rail owns chrome). */}
+      {!showNavRail && !chromeless && (
+        <FloatingButtons showHelp={showHelp} showCommandPalette={showCommandPalette} showDiagnostics={showDiagnostics} onHelp={() => setShowHelp(true)} onBugReport={() => setShowDiagnostics(true)} />
+      )}
 
       {/* Keyboard shortcut help overlay */}
       {helpOverlay.shouldRender && <ShortcutHelpOverlay isOpen={helpOverlay.isOpen} onClose={() => setShowHelp(false)} currentView={mainView} />}
@@ -1841,6 +1966,7 @@ function AppInner() {
 
       {/* Debug overlay - only in dev mode */}
       {import.meta.env.DEV && <DebugOverlay />}
+      </div>
     </div>
     </PortForwardProvider>
   )

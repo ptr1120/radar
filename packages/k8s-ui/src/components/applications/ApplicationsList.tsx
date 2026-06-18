@@ -1,10 +1,15 @@
 import { useMemo, useState, useEffect, useRef, useCallback } from 'react'
-import { ChevronRight, ChevronUp, ChevronDown, Layers, Info } from 'lucide-react'
+import { ChevronRight, Layers, Boxes, HeartPulse, Shapes, Globe, Tag } from 'lucide-react'
 import { clsx } from 'clsx'
 import { StatusDot, mapHealthToTone } from '../ui/status-tone'
 import { Tooltip } from '../ui/Tooltip'
 import { EmptyState } from '../ui/EmptyState'
 import { SearchBox } from '../ui/SearchBox'
+import { PageHeader } from '../ui/PageHeader'
+import { SummaryTile, type SummaryTone } from '../ui/SummaryTile'
+import { Facet, type FacetTone } from '../ui/Facet'
+import { SortableTh, TH_CLASS } from '../ui/SortableTh'
+import { DistributionBar } from '../ui/DistributionBar'
 import { useRegisterShortcuts } from '../../hooks/useKeyboardShortcuts'
 import { pluralize } from '../../utils/pluralize'
 import {
@@ -128,42 +133,13 @@ function searchTextForEntry(e: AppEntry): string {
     .toLowerCase()
 }
 
-export function Facet<T extends string>({ title, info, options, selected, onToggle }: { title: string; info?: React.ReactNode; options: { value: T; label: string; count: number; tone?: string; tooltip?: string }[]; selected: Set<T>; onToggle: (v: T) => void }) {
-  const visible = options.filter((o) => o.count > 0)
-  if (visible.length === 0) return null
-  return (
-    <div className="flex flex-col gap-1">
-      <div className="flex items-center gap-1 px-1 text-[10px] font-semibold uppercase tracking-wide text-theme-text-tertiary">
-        {title}
-        {info && (
-          <Tooltip content={info} delay={150} position="right">
-            <Info className="h-3 w-3 cursor-default text-theme-text-tertiary/70 hover:text-theme-text-secondary" aria-label={`About ${title}`} />
-          </Tooltip>
-        )}
-      </div>
-      {visible.map((o) => {
-        const on = selected.has(o.value)
-        const button = (
-          <button
-            key={o.value}
-            type="button"
-            onClick={() => onToggle(o.value)}
-            className={`flex w-full items-center justify-between gap-2 rounded px-2 py-1 text-left text-xs ${on ? 'selection selection-ring text-theme-text-primary' : 'text-theme-text-secondary hover:bg-theme-hover'}`}
-          >
-            <span className={`truncate ${o.tone ?? ''}`}>{o.label}</span>
-            <span className="font-mono tabular-nums text-theme-text-tertiary">{o.count}</span>
-          </button>
-        )
-        return o.tooltip ? (
-          <Tooltip key={o.value} content={o.tooltip} delay={300} position="right" wrapperClassName="w-full">
-            {button}
-          </Tooltip>
-        ) : (
-          button
-        )
-      })}
-    </div>
-  )
+// Availability is the one status facet — map app health onto the shared facet
+// tone so its dots read red/amber/green/grey like the GitOps sync+health facets.
+const HEALTH_TONE: Record<AppHealth, FacetTone> = {
+  unhealthy: 'error',
+  degraded: 'warning',
+  healthy: 'success',
+  unknown: 'neutral',
 }
 
 // Sortable columns. `health` is the implicit default (worst-first then name);
@@ -185,19 +161,6 @@ function compareEntries(a: AppEntry, b: AppEntry, key: SortKey): number {
       return (a.versions[0] ?? '').localeCompare(b.versions[0] ?? '')
     }
   }
-}
-
-function SortHeader({ label, sortKey, sort, onSort, className }: { label: string; sortKey: SortKey; sort: { key: SortKey; dir: SortDir } | null; onSort: (k: SortKey) => void; className?: string }) {
-  const active = sort?.key === sortKey
-  const ariaSort = active ? (sort!.dir === 'asc' ? 'ascending' : 'descending') : 'none'
-  return (
-    <th aria-sort={ariaSort} className={clsx('px-2 py-2 text-left text-[10px] font-medium uppercase tracking-wide cursor-pointer select-none text-theme-text-tertiary hover:text-theme-text-primary', className)} onClick={() => onSort(sortKey)}>
-      <span className="inline-flex items-center gap-1">
-        {label}
-        {active ? (sort!.dir === 'asc' ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />) : <span className="w-3" />}
-      </span>
-    </th>
-  )
 }
 
 export interface ApplicationsListProps {
@@ -345,75 +308,126 @@ export function ApplicationsList({ apps, onSelect }: ApplicationsListProps) {
     .sort((a, b) => (envRank(b[0] === 'none' ? undefined : b[0]) ?? -1) - (envRank(a[0] === 'none' ? undefined : a[0]) ?? -1))
     .map(([env, count]) => ({ value: env, label: env === 'none' ? 'unlabeled' : env, count }))
 
+  // Clickable status tile wired to the health facet — tap to filter to that tier.
+  const healthTile = (h: AppHealth, tone: SummaryTone) =>
+    counts.health[h] ? (
+      <SummaryTile key={h} label={HEALTH_META[h].label} value={counts.health[h]} tone={tone} active={fHealth.has(h)} onClick={() => toggle(fHealth, setFHealth, h)} />
+    ) : null
+
+  // showSystem lives in the Filters rail, so Clear resets it too (and its
+  // non-default ON state counts as an active filter that surfaces the button).
+  const anyFilterActive = !!(textFilter || fHealth.size || fClass.size || fType.size || fSource.size || fEnv.size || showSystem)
+  const clearAllFilters = () => {
+    setTextFilter('')
+    setFHealth(new Set())
+    setFClass(new Set())
+    setFType(new Set())
+    setFSource(new Set())
+    setFEnv(new Set())
+    setShowSystem(false)
+  }
+
   return (
-    <div className="flex w-full flex-1 flex-col gap-4">
-      {/* Health spectrum hero */}
-      <div className="flex flex-col gap-1.5 rounded-md border border-theme-border bg-theme-surface px-4 py-3">
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
-          <span className="font-medium text-theme-text-primary">
-            {entries.length < total ? `${entries.length} of ${total} applications` : pluralize(total, 'application')}
-          </span>
-          {HEALTH_ORDER.map((h) => (counts.health[h] ? <span key={h} className={HEALTH_META[h].text}>{HEALTH_META[h].label} {counts.health[h]}</span> : null))}
-          <span className="ml-auto text-theme-text-tertiary">
-            {sort ? `Sorted by ${sort.key} ${sort.dir === 'asc' ? '↑' : '↓'}` : 'Sorted by status'}
-          </span>
-        </div>
-        <div className="flex h-2 w-full overflow-hidden rounded-full bg-theme-hover">
-          {HEALTH_ORDER.map((h) => (counts.health[h] ? <span key={h} className={HEALTH_META[h].bar} style={{ width: `${(counts.health[h] / total) * 100}%` }} title={`${HEALTH_META[h].label} ${counts.health[h]}`} /> : null))}
-        </div>
+    <div className="flex h-full w-full min-w-0 flex-1 flex-col overflow-hidden bg-theme-base">
+      {/* Header band: title + description + clickable status tiles + slim health
+          bar. Same chassis as the GitOps view so the two list surfaces read as
+          siblings (status in the header, filters in a left rail, search in a
+          toolbar). */}
+      <div className="shrink-0 border-b border-theme-border px-4 py-4">
+        <PageHeader
+          icon={Boxes}
+          title="Applications"
+          description="Deployable software in this cluster — your services, workers, and jobs, grouped by app/release evidence."
+          actions={
+            <>
+              <SummaryTile label={total === 1 ? 'application' : 'applications'} value={total} />
+              {healthTile('unhealthy', 'error')}
+              {healthTile('degraded', 'warning')}
+              {healthTile('healthy', 'success')}
+              {healthTile('unknown', 'neutral')}
+            </>
+          }
+        />
+        <DistributionBar
+          className="mt-3"
+          ariaLabel="Health distribution"
+          segments={HEALTH_ORDER.map((h) => ({ key: h, count: counts.health[h] ?? 0, fillClass: HEALTH_META[h].bar }))}
+        />
       </div>
 
-      <SearchBox
-        value={textFilter}
-        onChange={setTextFilter}
-        scope="applications"
-        shortcutId="applications-search"
-        className="max-w-md"
-        onEnter={() => {
-          const key = highlightedIndex >= 0 && rowsRef.current[highlightedIndex]?.kind === 'instance'
-            ? (rowsRef.current[highlightedIndex] as Extract<FoldedRow<AppEntry>, { kind: 'instance' }>).entry.row.key
-            : firstOpenableVisibleRow()
-          if (key) onSelect(key)
-        }}
-        onArrowDown={() => {
-          if (visibleRows.length > 0) setHighlightedIndex(0)
-        }}
-      />
-
-      <div className="flex w-full gap-4">
-        {/* Facet rail */}
-        <aside className="hidden w-[200px] shrink-0 flex-col gap-4 lg:flex">
-          <Facet title="Availability" options={HEALTH_ORDER.map((h) => ({ value: h, label: HEALTH_META[h].label, count: counts.health[h] ?? 0, tone: HEALTH_META[h].text }))} selected={fHealth} onToggle={(v) => toggle(fHealth, setFHealth, v)} />
-          <Facet title="Class" options={CLASS_ORDER.map((c) => ({ value: c, label: CLASS_META[c].label, count: counts.workloadClass[c] ?? 0 }))} selected={fClass} onToggle={(v) => toggle(fClass, setFClass, v)} />
-          <Facet title="Type" options={CATEGORY_ORDER.map((c) => ({ value: c, label: CATEGORY_META[c].label, count: counts.category[c] ?? 0, tooltip: CATEGORY_META[c].tooltip }))} selected={fType} onToggle={(v) => toggle(fType, setFType, v)} />
-          <Facet title="Environment" info={<EnvHint />} options={envOptions} selected={fEnv} onToggle={(v) => toggle(fEnv, setFEnv, v)} />
-          <Facet title="Source" options={SOURCE_ORDER.map((s) => ({ value: s, label: SOURCE_META[s].label, count: counts.source[s] ?? 0 }))} selected={fSource} onToggle={(v) => toggle(fSource, setFSource, v)} />
-          {systemCount > 0 && (
-            <label className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-xs text-theme-text-secondary hover:bg-theme-hover">
-              <input type="checkbox" checked={showSystem} onChange={(e) => setShowSystem(e.target.checked)} className="accent-skyhook-500" />
-              <span>Show system namespaces</span>
-              <span className="ml-auto font-mono tabular-nums text-theme-text-tertiary">{systemCount}</span>
-            </label>
-          )}
+      {/* Body: filter sidebar | content (toolbar + table). */}
+      <div className="flex min-w-0 flex-1 overflow-hidden max-[899px]:flex-col">
+        {/* Filters sidebar — titled, with Clear; mirrors the GitOps facet rail.
+            Arbitrary 900px breakpoint (not `sm`) so the collapse is independent of
+            the consuming app's Tailwind breakpoint config (Hub uses defaults). */}
+        <aside className="flex w-52 shrink-0 flex-col overflow-hidden border-r border-theme-border bg-theme-surface/90 max-[899px]:max-h-72 max-[899px]:w-full max-[899px]:border-b max-[899px]:border-r-0">
+          <div className="flex items-center justify-between border-b border-theme-border px-3 py-2">
+            <span className="text-sm font-medium text-theme-text-secondary">Filters</span>
+            {anyFilterActive && (
+              <button type="button" onClick={clearAllFilters} className="text-[10px] font-medium text-blue-500 hover:text-blue-400">Clear</button>
+            )}
+          </div>
+          <div className="flex-1 overflow-y-auto">
+            <Facet icon={HeartPulse} title="Availability" options={HEALTH_ORDER.map((h) => ({ value: h, label: HEALTH_META[h].label, count: counts.health[h] ?? 0, tone: HEALTH_TONE[h] }))} selected={fHealth} onToggle={(v) => toggle(fHealth, setFHealth, v)} />
+            <Facet icon={Layers} title="Class" options={CLASS_ORDER.map((c) => ({ value: c, label: CLASS_META[c].label, count: counts.workloadClass[c] ?? 0 }))} selected={fClass} onToggle={(v) => toggle(fClass, setFClass, v)} />
+            <Facet icon={Shapes} title="Type" options={CATEGORY_ORDER.map((c) => ({ value: c, label: CATEGORY_META[c].label, count: counts.category[c] ?? 0, tooltip: CATEGORY_META[c].tooltip }))} selected={fType} onToggle={(v) => toggle(fType, setFType, v)} />
+            <Facet icon={Globe} title="Environment" info={<EnvHint />} options={envOptions} selected={fEnv} onToggle={(v) => toggle(fEnv, setFEnv, v)} />
+            <Facet icon={Tag} title="Source" options={SOURCE_ORDER.map((s) => ({ value: s, label: SOURCE_META[s].label, count: counts.source[s] ?? 0 }))} selected={fSource} onToggle={(v) => toggle(fSource, setFSource, v)} />
+            {systemCount > 0 && (
+              <label className="flex cursor-pointer items-center gap-2 border-b border-theme-border px-3 py-2 text-[11px] text-theme-text-secondary hover:bg-theme-hover">
+                <input type="checkbox" checked={showSystem} onChange={(e) => setShowSystem(e.target.checked)} className="accent-skyhook-500" />
+                <span>Show system namespaces</span>
+                <span className="ml-auto tabular-nums text-theme-text-tertiary">{systemCount}</span>
+              </label>
+            )}
+          </div>
         </aside>
 
-        {/* Table */}
-        <div className="min-w-0 flex-1">
+        {/* Content: toolbar (search + sort) over the scrollable table. */}
+        <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+          <div className="flex shrink-0 items-center gap-3 border-b border-theme-border px-4 py-3">
+            <SearchBox
+              value={textFilter}
+              onChange={setTextFilter}
+              scope="applications"
+              shortcutId="applications-search"
+              className="max-w-md flex-1"
+              onEnter={() => {
+                const key = highlightedIndex >= 0 && rowsRef.current[highlightedIndex]?.kind === 'instance'
+                  ? (rowsRef.current[highlightedIndex] as Extract<FoldedRow<AppEntry>, { kind: 'instance' }>).entry.row.key
+                  : firstOpenableVisibleRow()
+                if (key) onSelect(key)
+              }}
+              onArrowDown={() => {
+                if (visibleRows.length > 0) setHighlightedIndex(0)
+              }}
+            />
+            {/* Sorting is via the clickable column headers (Resources-table
+                pattern) — no separate sort control. */}
+          </div>
+
+          <div className="min-w-0 flex-1 overflow-auto bg-theme-base">
           {entries.length === 0 ? (
-            <EmptyState tone="filtered" variant="card" headline="No applications match the filters" body="Clear the filters above." />
+            <div className="p-4">
+              <EmptyState
+                tone="filtered"
+                variant="card"
+                headline={total === 0 ? 'No applications detected yet' : 'No applications match the filters'}
+                body={total === 0 ? 'Deploy services, workers, or jobs to this cluster to see them grouped by app.' : 'Clear the filters above.'}
+              />
+            </div>
           ) : (
-            <div className="overflow-hidden rounded-md border border-theme-border">
               <table className="w-full text-left text-sm">
-                <thead>
-                  <tr className="border-b border-theme-border bg-theme-base">
-                    <SortHeader label="Application" sortKey="name" sort={sort} onSort={onSort} className="pl-3 pr-2" />
-                    <th className="px-2 py-2 text-[10px] font-medium uppercase tracking-wide text-theme-text-tertiary">Namespace</th>
-                    <th className="px-2 py-2 text-[10px] font-medium uppercase tracking-wide text-theme-text-tertiary">Env</th>
-                    <th className="px-2 py-2 text-[10px] font-medium uppercase tracking-wide text-theme-text-tertiary">Class</th>
-                    <SortHeader label="Ready" sortKey="ready" sort={sort} onSort={onSort} />
-                    <SortHeader label="Version" sortKey="version" sort={sort} onSort={onSort} />
-                    <th className="px-2 py-2 text-[10px] font-medium uppercase tracking-wide text-theme-text-tertiary">Workloads</th>
-                    <th className="w-8" />
+                <thead className="sticky top-0 z-10 bg-theme-base">
+                  <tr>
+                    <SortableTh label="Application" sortKey="name" activeKey={sort?.key ?? null} direction={sort?.dir ?? 'asc'} onSort={onSort} />
+                    <th className={TH_CLASS}>Namespace</th>
+                    <th className={TH_CLASS}>Env</th>
+                    <th className={TH_CLASS}>Class</th>
+                    <SortableTh label="Ready" sortKey="ready" activeKey={sort?.key ?? null} direction={sort?.dir ?? 'asc'} onSort={onSort} />
+                    <SortableTh label="Version" sortKey="version" activeKey={sort?.key ?? null} direction={sort?.dir ?? 'asc'} onSort={onSort} />
+                    <th className={TH_CLASS}>Workloads</th>
+                    <th className={clsx(TH_CLASS, 'w-8')} />
                   </tr>
                 </thead>
                 <tbody>
@@ -430,10 +444,12 @@ export function ApplicationsList({ apps, onSelect }: ApplicationsListProps) {
                     >
                       <td className="py-2.5 pl-3 pr-2">
                         <span className="flex items-center gap-2">
-                          <ChevronRight className={clsx('h-3.5 w-3.5 shrink-0 text-theme-text-tertiary transition-transform', r.expanded && 'rotate-90')} aria-hidden />
+                          {/* Left status stripe (worst-child health) — the row status
+                              gutter shared with the GitOps table. */}
                           <Tooltip content={HEALTH_META[r.health].label} delay={150}>
-                            <span className="inline-flex"><StatusDot tone={mapHealthToTone(r.health)} /></span>
+                            <span className={clsx('h-8 w-1 shrink-0 rounded-full', HEALTH_META[r.health].bar)} />
                           </Tooltip>
+                          <ChevronRight className={clsx('h-3.5 w-3.5 shrink-0 text-theme-text-tertiary transition-transform', r.expanded && 'rotate-90')} aria-hidden />
                           <span className="truncate font-semibold text-theme-text-primary">{r.label}</span>
                           <Tooltip
                             content={<AppIdentityTooltip identityKey={r.label} members={r.members.map((m) => ({ name: m.row.name, env: m.row.identity!.env, confidence: m.row.identity!.confidence, evidence: m.row.identity!.evidence }))} />}
@@ -510,7 +526,7 @@ export function ApplicationsList({ apps, onSelect }: ApplicationsListProps) {
                       <td className={clsx('py-2.5 pr-2', r.child ? 'pl-10' : 'pl-3')}>
                         <span className="flex items-center gap-2">
                           <Tooltip content={HEALTH_META[e.health].label} delay={150}>
-                            <span className="inline-flex"><StatusDot tone={mapHealthToTone(e.health)} /></span>
+                            <span className={clsx('h-8 w-1 shrink-0 rounded-full', HEALTH_META[e.health].bar)} />
                           </Tooltip>
                           <span className="truncate font-medium text-theme-text-primary">{e.row.name}</span>
                           <ProvenanceBadge tier={e.row.tier} appKey={e.row.key} confidence={e.row.confidence} />
@@ -560,8 +576,8 @@ export function ApplicationsList({ apps, onSelect }: ApplicationsListProps) {
                   ))(r.entry))}
                 </tbody>
               </table>
-            </div>
           )}
+          </div>
         </div>
       </div>
     </div>

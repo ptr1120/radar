@@ -3,7 +3,9 @@ import { clsx } from 'clsx'
 import {
   AlertTriangle,
   ArrowDownUp,
+  Check,
   CheckCircle2,
+  ChevronDown,
   CircleAlert,
   CircleDot,
   GitBranch,
@@ -25,7 +27,13 @@ import {
 
 import { HealthStatusBadge, SyncStatusBadge } from './GitOpsStatusBadge'
 import { Tooltip } from '../ui/Tooltip'
+import { PageHeader } from '../ui/PageHeader'
+import { SummaryTile, type SummaryTone } from '../ui/SummaryTile'
+import { FacetSection, FacetButton } from '../ui/Facet'
+import { SortableTh, TH_CLASS, type SortDir } from '../ui/SortableTh'
+import { DistributionBar } from '../ui/DistributionBar'
 import { RowActionMenu, type RowActionItem } from '../ui/RowActionMenu'
+import { useRefreshAnimation } from '../../hooks/useRefreshAnimation'
 import { getGitOpsResourceStatus } from './detail-helpers'
 import { isArgoSuspendedByRadar } from '../resources/resource-utils-argo'
 import { toggleSet } from './GitOpsGraphFilterRail'
@@ -59,8 +67,16 @@ import { parseContextName } from '../../utils/context-name'
 // ----- Types -----------------------------------------------------------------
 
 export type GitOpsMode = 'applications' | 'sources' | 'projects' | 'alerts'
+// Resource categories with an implemented view. Sources/Projects/Alerts are
+// still stubbed ("queued"), so only `applications` ships today — which is why
+// the Scope switcher stays hidden until a second category lands. A one-option
+// switcher is just noise (an always-selected pill that can't be changed).
+const AVAILABLE_MODES: GitOpsMode[] = ['applications']
 export type GitOpsViewMode = 'table' | 'tiles'
-export type SortKey = 'name' | 'health' | 'sync' | 'lastSync' | 'project'
+// 'urgency' is the curated DEFAULT order (what needs attention first) — not a
+// column, so no header shows it as active; clicking any header replaces it with
+// that column's own semantics.
+export type SortKey = 'urgency' | 'name' | 'health' | 'sync' | 'lastSync' | 'project'
 
 // Row-level actions surfaced from the table's three-dot menu. The set
 // mirrors what the detail page exposes today; callers wire the mutations
@@ -141,15 +157,17 @@ export interface GitOpsRow {
 
 export type DestinationFilter = 'all' | 'this-cluster' | 'cross-cluster' | 'unmatched'
 
-type SummaryTone = 'neutral' | 'warning' | 'error' | 'info'
-
 interface SummaryTileSpec {
   key: string
   label: string
   value: number
   tone: SummaryTone
   active: boolean
+  // A status tile toggles its OWN dimension: `apply` sets it (when off),
+  // `clear` resets just that dimension (when on) — composing with other
+  // facets + search instead of wiping them. The Total tile resets everything.
   apply?: () => void
+  clear?: () => void
 }
 
 // ----- Component props -------------------------------------------------------
@@ -270,10 +288,30 @@ export function GitOpsTableView({
   const [labelFilters, setLabelFilters] = useState<Set<string>>(new Set())
   const [showLabelsDropdown, setShowLabelsDropdown] = useState(false)
   const [labelSearch, setLabelSearch] = useState('')
-  const [automationFilter, setAutomationFilter] = useState<'all' | 'auto' | 'manual' | 'suspended'>('all')
+  // Auto-sync / Manual / Suspended are INDEPENDENT row attributes (a Flux app can
+  // be auto-reconciling AND suspended), so this is a multi-select facet like Sync
+  // and Health — not the old single-select that conflated the mode (auto vs
+  // manual) with the orthogonal suspended state.
+  const [automationFilters, setAutomationFilters] = useState<Set<'auto' | 'manual' | 'suspended'>>(new Set())
+  const toggleAutomation = useCallback((value: 'auto' | 'manual' | 'suspended') => {
+    setAutomationFilters((prev) => {
+      const next = new Set(prev)
+      next.has(value) ? next.delete(value) : next.add(value)
+      return next
+    })
+  }, [])
   const [lifecycleFilter, setLifecycleFilter] = useState<'all' | 'terminating' | 'active'>('all')
-  const [reconcilingOnly, setReconcilingOnly] = useState(false)
-  const [sortKey, setSortKey] = useState<SortKey>('health')
+  const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: 'urgency', dir: 'asc' })
+  // Shared refresh feedback (spin ≥400ms → checkmark) so clicking Refresh gives
+  // the same visual confirmation as every other view, even when the refetch is
+  // instant (the cache is already warm).
+  const [triggerRefresh, , refreshPhase] = useRefreshAnimation(onRefresh ?? (() => {}))
+  // Clicking a column sorts by it (starting at the column's natural direction —
+  // e.g. last-sync newest-first); clicking the active column reverses.
+  const onSort = useCallback(
+    (key: SortKey) => setSort((prev) => (prev.key === key ? { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: SORT_DEFAULT_DIR[key] })),
+    [],
+  )
 
   const hasLocalFilters =
     !!search ||
@@ -282,7 +320,7 @@ export function GitOpsTableView({
     projectFilters.size > 0 ||
     namespaceFilters.size > 0 ||
     labelFilters.size > 0 ||
-    automationFilter !== 'all' ||
+    automationFilters.size > 0 ||
     lifecycleFilter !== 'all'
   const hasGlobalNamespaceFilter = !!onClearNamespaces && (globalNamespaces?.length ?? 0) > 0
   const hasAnyFilter = hasLocalFilters || hasGlobalNamespaceFilter
@@ -327,6 +365,25 @@ export function GitOpsTableView({
   )
   const syncCounts = useMemo(() => countMap(allRows.map((row) => row.sync)), [allRows])
   const healthCounts = useMemo(() => countMap(allRows.map((row) => row.health)), [allRows])
+  const automationCounts = useMemo(() => ({
+    auto: allRows.filter((row) => row.autoSync).length,
+    manual: allRows.filter((row) => !row.autoSync).length,
+    suspended: allRows.filter((row) => row.suspended).length,
+  }), [allRows])
+  // The Destination column earns its width only when destinations actually vary
+  // — in single-cluster OSS every row is the same in-cluster API server, so the
+  // column is dead weight. Show it when any row is cross-cluster (Hub) or when
+  // destinations differ; hide when they all collapse to the in-cluster default.
+  const showDestination = useMemo(() => {
+    // Fleet/Hub mode owns the Destination column outright (it's the multi-cluster
+    // product surface — the destination filter + cross-cluster matching live here).
+    if (onDestinationFilterChange) return true
+    if (allRows.some((r) => r._destination && r._destination.match !== 'in_cluster')) return true
+    const dests = new Set(allRows.map((r) => r.destination).filter(Boolean))
+    if (dests.size > 1) return true
+    const only = [...dests][0] ?? ''
+    return !!only && !/kubernetes\.default\.svc/i.test(only)
+  }, [allRows, onDestinationFilterChange])
   const labels = useMemo(() => countLabels(allRows), [allRows])
   const filteredRows = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -354,12 +411,13 @@ export function GitOpsTableView({
       if (projectFilters.size > 0 && !projectFilters.has(row.project || '(none)')) return false
       if (namespaceFilters.size > 0 && !namespaceFilters.has(row.namespace || '(cluster)')) return false
       if (activeLabels.length > 0 && !activeLabels.every(({ key, value }) => row.labels[key] === value)) return false
-      if (automationFilter === 'auto' && !row.autoSync) return false
-      if (automationFilter === 'manual' && row.autoSync) return false
-      if (automationFilter === 'suspended' && !row.suspended) return false
+      if (automationFilters.size > 0 && !(
+        (automationFilters.has('auto') && row.autoSync) ||
+        (automationFilters.has('manual') && !row.autoSync) ||
+        (automationFilters.has('suspended') && row.suspended)
+      )) return false
       if (lifecycleFilter === 'terminating' && !row.terminating) return false
       if (lifecycleFilter === 'active' && row.terminating) return false
-      if (reconcilingOnly && row.sync !== 'Reconciling' && row.health !== 'Progressing') return false
       if (destinationFilter && destinationFilter !== 'all') {
         const match = row._destination?.match
         if (destinationFilter === 'this-cluster' && match !== 'in_cluster') return false
@@ -372,8 +430,8 @@ export function GitOpsTableView({
       }
       return true
     })
-    return [...rows].sort((a, b) => compareRows(a, b, sortKey))
-  }, [allRows, automationFilter, healthFilters, labelFilters, lifecycleFilter, mode, namespaceFilters, projectFilters, search, sortKey, syncFilters, destinationFilter, reconcilingOnly])
+    return [...rows].sort((a, b) => compareRows(a, b, sort.key) * (sort.dir === 'asc' ? 1 : -1))
+  }, [allRows, automationFilters, healthFilters, labelFilters, lifecycleFilter, mode, namespaceFilters, projectFilters, search, sort, syncFilters, destinationFilter])
 
   const terminatingCount = useMemo(() => allRows.filter((row) => row.terminating).length, [allRows])
 
@@ -384,29 +442,24 @@ export function GitOpsTableView({
     setProjectFilters(new Set())
     setNamespaceFilters(new Set())
     setLabelFilters(new Set())
-    setAutomationFilter('all')
+    setAutomationFilters(new Set())
     setLifecycleFilter('all')
-    setReconcilingOnly(false)
     onClearNamespaces?.()
     onDestinationFilterChange?.('all')
   }, [onClearNamespaces, onDestinationFilterChange])
 
+  // True when nothing is filtered at all — backs the Total tile's active state.
   const noOtherFiltersActive = useCallback(
-    (
-      exclude: 'sync' | 'health' | 'automation' | 'destination' | 'reconciling' | null = null,
-    ) => {
-      if (search !== '') return false
-      if (exclude !== 'sync' && syncFilters.size > 0) return false
-      if (exclude !== 'health' && healthFilters.size > 0) return false
-      if (projectFilters.size > 0) return false
-      if (namespaceFilters.size > 0) return false
-      if (labelFilters.size > 0) return false
-      if (exclude !== 'automation' && automationFilter !== 'all') return false
-      if (lifecycleFilter !== 'all') return false
-      if (exclude !== 'destination' && destinationFilter && destinationFilter !== 'all') return false
-      if (exclude !== 'reconciling' && reconcilingOnly) return false
-      return true
-    },
+    () =>
+      search === '' &&
+      syncFilters.size === 0 &&
+      healthFilters.size === 0 &&
+      projectFilters.size === 0 &&
+      namespaceFilters.size === 0 &&
+      labelFilters.size === 0 &&
+      automationFilters.size === 0 &&
+      lifecycleFilter === 'all' &&
+      (!destinationFilter || destinationFilter === 'all'),
     [
       search,
       syncFilters,
@@ -414,10 +467,9 @@ export function GitOpsTableView({
       projectFilters,
       namespaceFilters,
       labelFilters,
-      automationFilter,
+      automationFilters,
       lifecycleFilter,
       destinationFilter,
-      reconcilingOnly,
     ],
   )
 
@@ -426,7 +478,10 @@ export function GitOpsTableView({
   // namespace-scoped zero is NOT the same as cluster-empty. Fall through
   // to the actionable empty state below when the host owns a namespace
   // pick we can clear; otherwise the user lands here with no escape hatch.
-  if (totalGitOps === 0 && !loading && !hasGlobalNamespaceFilter) {
+  // Also require zero actual rows: the cold-cache retry can populate `rows`
+  // before the separate counts map catches up, and a populated table must not
+  // be hidden behind a "nothing here" screen.
+  if (totalGitOps === 0 && allRowsInput.length === 0 && !loading && !hasGlobalNamespaceFilter) {
     return (
       <div className="flex h-full min-h-0 flex-1 items-center justify-center bg-theme-base p-4">
         <div className="rounded-lg border border-theme-border bg-theme-surface p-8 text-center">
@@ -444,6 +499,11 @@ export function GitOpsTableView({
 
   const showCrossClusterTile = typeof crossClusterCount === 'number' && mode === 'applications'
 
+  // Header tiles unify with the facet rail: each STATUS tile toggles its own
+  // dimension and composes with the other facets + search (clicking "Out of
+  // sync" adds sync=OutOfSync without wiping an active health filter or your
+  // search). `active` = "this dimension is exactly this value". The Total tile
+  // is the reset — it clears everything.
   const summaryTiles: SummaryTileSpec[] = [
     {
       key: 'total',
@@ -451,40 +511,44 @@ export function GitOpsTableView({
       value: allRows.length,
       tone: 'neutral',
       active: noOtherFiltersActive(),
+      apply: clearAllFilters,
+      clear: clearAllFilters,
     },
     {
       key: 'outOfSync',
       label: 'Out of sync',
       value: statusSummary.outOfSync,
       tone: 'warning',
-      active:
-        syncFilters.size === 1 && syncFilters.has('OutOfSync') && noOtherFiltersActive('sync'),
+      active: syncFilters.size === 1 && syncFilters.has('OutOfSync'),
       apply: () => setSyncFilters(new Set(['OutOfSync'])),
+      clear: () => setSyncFilters(new Set()),
     },
     {
       key: 'degraded',
       label: 'Degraded',
       value: statusSummary.degraded,
       tone: 'error',
-      active:
-        healthFilters.size === 1 && healthFilters.has('Degraded') && noOtherFiltersActive('health'),
+      active: healthFilters.size === 1 && healthFilters.has('Degraded'),
       apply: () => setHealthFilters(new Set(['Degraded'])),
+      clear: () => setHealthFilters(new Set()),
     },
     {
       key: 'suspended',
       label: 'Suspended',
       value: statusSummary.suspended,
       tone: 'warning',
-      active: automationFilter === 'suspended' && noOtherFiltersActive('automation'),
-      apply: () => setAutomationFilter('suspended'),
+      active: automationFilters.size === 1 && automationFilters.has('suspended'),
+      apply: () => setAutomationFilters(new Set(['suspended'])),
+      clear: () => setAutomationFilters(new Set()),
     },
     {
       key: 'reconciling',
       label: 'Reconciling',
-      value: statusSummary.reconciling,
+      value: syncCounts.get('Reconciling') ?? 0,
       tone: 'info',
-      active: reconcilingOnly && noOtherFiltersActive('reconciling'),
-      apply: () => setReconcilingOnly(true),
+      active: syncFilters.size === 1 && syncFilters.has('Reconciling'),
+      apply: () => setSyncFilters(new Set(['Reconciling'])),
+      clear: () => setSyncFilters(new Set()),
     },
     ...(showCrossClusterTile
       ? [
@@ -493,19 +557,42 @@ export function GitOpsTableView({
             label: 'Cross-cluster',
             value: crossClusterCount!,
             tone: 'info' as const,
-            active: destinationFilter === 'cross-cluster' && noOtherFiltersActive('destination'),
+            active: destinationFilter === 'cross-cluster',
             apply: () => onDestinationFilterChange?.('cross-cluster'),
+            clear: () => onDestinationFilterChange?.('all'),
           },
         ]
       : []),
   ]
 
   return (
-    <div
-      className={`flex h-full min-w-0 flex-1 overflow-hidden bg-theme-base max-lg:flex-col ${
-        filtersSide === 'right' ? 'lg:flex-row-reverse' : ''
-      }`}
-    >
+    <div className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-theme-base">
+      {/* Full-width header on top; the filter facet + content sit below it. */}
+      <div className="shrink-0 border-b border-theme-border bg-theme-base px-4 py-4">
+        <PageHeader
+          icon={GitBranch}
+          title="GitOps"
+          description="Applications and reconciliations with source, destination, sync, and health state."
+          actions={summaryTiles.map((tile) => (
+            <SummaryTile
+              key={tile.key}
+              label={tile.label}
+              value={tile.value}
+              tone={tile.tone}
+              active={tile.active}
+              onClick={() => {
+                if (tile.active) tile.clear?.()
+                else tile.apply?.()
+              }}
+            />
+          ))}
+        />
+      </div>
+      <div
+        className={`flex min-w-0 flex-1 overflow-hidden max-[899px]:flex-col ${
+          filtersSide === 'right' ? 'min-[900px]:flex-row-reverse' : ''
+        }`}
+      >
       <GitOpsFilterSidebar
         side={filtersSide}
         mode={mode}
@@ -517,8 +604,9 @@ export function GitOpsTableView({
         healthCounts={healthCounts}
         healthFilters={healthFilters}
         onToggleHealth={(value) => toggleSet(healthFilters, setHealthFilters, value)}
-        automationFilter={automationFilter}
-        onAutomationFilterChange={setAutomationFilter}
+        automationFilters={automationFilters}
+        automationCounts={automationCounts}
+        onToggleAutomation={toggleAutomation}
         lifecycleFilter={lifecycleFilter}
         onLifecycleFilterChange={setLifecycleFilter}
         terminatingCount={terminatingCount}
@@ -532,32 +620,6 @@ export function GitOpsTableView({
       />
 
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        <div className="shrink-0 border-b border-theme-border bg-theme-base px-4 py-3">
-          <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-            <div className="min-w-0">
-              <h1 className="text-lg font-semibold text-theme-text-primary">GitOps</h1>
-              <p className="truncate text-sm text-theme-text-secondary">
-                Applications and reconciliations with source, destination, sync, and health state.
-              </p>
-            </div>
-            <div className="flex shrink-0 flex-wrap justify-end gap-2">
-              {summaryTiles.map((tile) => (
-                <SummaryTile
-                  key={tile.key}
-                  label={tile.label}
-                  value={tile.value}
-                  tone={tile.tone}
-                  active={tile.active}
-                  onClick={() => {
-                    clearAllFilters()
-                    if (!tile.active && tile.apply) tile.apply()
-                  }}
-                />
-              ))}
-            </div>
-          </div>
-        </div>
-
         {forbiddenSecretsClusters && forbiddenSecretsClusters.length > 0 && mode === 'applications' && (
           // Hub-only graceful-degradation note: when the user lacks `get
           // secrets` in the argocd namespace on a controller, the hub
@@ -589,17 +651,12 @@ export function GitOpsTableView({
                 Showing {filteredRows.length} of {allRows.length}
               </span>
             )}
-            <select
-              value={sortKey}
-              onChange={(e) => setSortKey(e.target.value as SortKey)}
-              className="h-8 rounded-md border border-theme-border bg-theme-base px-2 text-xs text-theme-text-primary focus:outline-none focus:ring-1 focus:ring-blue-500/50"
-            >
-              <option value="health">Sort: health</option>
-              <option value="sync">Sort: sync</option>
-              <option value="lastSync">Sort: last sync</option>
-              <option value="project">Sort: project</option>
-              <option value="name">Sort: name</option>
-            </select>
+            {/* Table mode sorts via clickable column headers (Resources-table
+                pattern); tile mode has no headers, so it keeps a compact sort
+                control wired to the same sort state. */}
+            {viewMode === 'tiles' && (
+              <GitOpsSortMenu sortKey={sort.key} onChange={(k) => setSort({ key: k, dir: SORT_DEFAULT_DIR[k] })} />
+            )}
             {labels.length > 0 && (
               <LabelsDropdown
                 labels={labels}
@@ -651,10 +708,12 @@ export function GitOpsTableView({
               <Tooltip content="Refresh GitOps resources">
                 <button
                   type="button"
-                  onClick={onRefresh}
+                  onClick={triggerRefresh}
                   className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-theme-border bg-theme-base text-theme-text-secondary hover:bg-theme-hover hover:text-theme-text-primary"
                 >
-                  <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+                  {refreshPhase === 'success'
+                    ? <Check className="h-3.5 w-3.5 text-emerald-500" />
+                    : <RefreshCw className={clsx('h-3.5 w-3.5', (refreshPhase === 'spinning' || loading) && 'animate-spin')} />}
                 </button>
               </Tooltip>
             )}
@@ -701,8 +760,11 @@ export function GitOpsTableView({
           ) : (
             <GitOpsTable
               rows={filteredRows}
+              sort={sort}
+              onSort={onSort}
               onOpen={onRowClick}
               hrefFor={rowHrefFor}
+              showDestination={showDestination}
               onDestinationClick={onDestinationClick}
               destinationHrefFor={destinationHrefFor}
               onRowAction={onRowAction}
@@ -710,6 +772,7 @@ export function GitOpsTableView({
             />
           )}
         </div>
+      </div>
       </div>
     </div>
   )
@@ -731,8 +794,9 @@ function GitOpsFilterSidebar({
   healthCounts,
   healthFilters,
   onToggleHealth,
-  automationFilter,
-  onAutomationFilterChange,
+  automationFilters,
+  automationCounts,
+  onToggleAutomation,
   lifecycleFilter,
   onLifecycleFilterChange,
   terminatingCount,
@@ -754,8 +818,9 @@ function GitOpsFilterSidebar({
   healthCounts: Map<string, number>
   healthFilters: Set<string>
   onToggleHealth: (value: string) => void
-  automationFilter: 'all' | 'auto' | 'manual' | 'suspended'
-  onAutomationFilterChange: (value: 'all' | 'auto' | 'manual' | 'suspended') => void
+  automationFilters: Set<'auto' | 'manual' | 'suspended'>
+  automationCounts: { auto: number; manual: number; suspended: number }
+  onToggleAutomation: (value: 'auto' | 'manual' | 'suspended') => void
   lifecycleFilter: 'all' | 'terminating' | 'active'
   onLifecycleFilterChange: (value: 'all' | 'terminating' | 'active') => void
   terminatingCount: number
@@ -769,20 +834,21 @@ function GitOpsFilterSidebar({
 }) {
   return (
     <aside
-      className={`flex w-72 shrink-0 flex-col overflow-hidden border-theme-border bg-theme-surface/90 max-lg:max-h-72 max-lg:w-full max-lg:border-b ${
-        side === 'right' ? 'border-l max-lg:border-l-0' : 'border-r max-lg:border-r-0'
+      className={`flex w-72 shrink-0 flex-col overflow-hidden border-theme-border bg-theme-surface/90 max-[899px]:max-h-72 max-[899px]:w-full max-[899px]:border-b ${
+        side === 'right' ? 'border-l max-[899px]:border-l-0' : 'border-r max-[899px]:border-r-0'
       }`}
     >
       <div className="flex items-center justify-between border-b border-theme-border px-3 py-2">
-        <span className="text-sm font-medium text-theme-text-secondary">GitOps Filters</span>
+        <span className="text-sm font-medium text-theme-text-secondary">Filters</span>
         <button type="button" onClick={onClear} className="text-[10px] font-medium text-blue-500 hover:text-blue-400">
           Clear
         </button>
       </div>
       <div className="flex-1 overflow-y-auto">
+        {AVAILABLE_MODES.length > 1 && (
         <GitOpsFilterSection icon={GitBranch} title="Scope">
           <div className="grid grid-cols-2 gap-1">
-            {(['applications'] as GitOpsMode[]).map((item) => (
+            {AVAILABLE_MODES.map((item) => (
               <button
                 key={item}
                 type="button"
@@ -799,6 +865,7 @@ function GitOpsFilterSidebar({
             ))}
           </div>
         </GitOpsFilterSection>
+        )}
 
         <GitOpsFilterSection icon={CheckCircle2} title="Sync">
           <GitOpsFacetButton label="Synced" count={syncCounts.get('Synced') ?? 0} active={syncFilters.has('Synced')} tone="success" onClick={() => onToggleSync('Synced')} />
@@ -815,28 +882,10 @@ function GitOpsFilterSidebar({
           <GitOpsFacetButton label="Unknown" count={healthCounts.get('Unknown') ?? 0} active={healthFilters.has('Unknown')} onClick={() => onToggleHealth('Unknown')} />
         </GitOpsFilterSection>
 
-        <GitOpsFilterSection icon={CircleDot} title="Automation">
-          <div className="grid grid-cols-2 gap-1">
-            {([
-              ['all', 'All'],
-              ['auto', 'Auto-sync'],
-              ['manual', 'Manual'],
-              ['suspended', 'Suspended'],
-            ] as const).map(([value, label]) => (
-              <button
-                key={value}
-                type="button"
-                onClick={() => onAutomationFilterChange(value)}
-                className={`rounded-md px-2 py-1.5 text-[11px] font-medium transition-colors ${
-                  automationFilter === value
-                    ? 'bg-skyhook-500 text-white'
-                    : 'bg-theme-elevated text-theme-text-secondary hover:bg-theme-hover hover:text-theme-text-primary'
-                }`}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
+        <GitOpsFilterSection icon={CircleDot} title="Automation (Sync policy)">
+          <GitOpsFacetButton label="Auto-sync" count={automationCounts.auto} active={automationFilters.has('auto')} onClick={() => onToggleAutomation('auto')} />
+          <GitOpsFacetButton label="Manual" count={automationCounts.manual} active={automationFilters.has('manual')} onClick={() => onToggleAutomation('manual')} />
+          <GitOpsFacetButton label="Suspended" count={automationCounts.suspended} active={automationFilters.has('suspended')} tone="warning" onClick={() => onToggleAutomation('suspended')} />
         </GitOpsFilterSection>
 
         {terminatingCount > 0 && (
@@ -894,62 +943,14 @@ function GitOpsFilterSidebar({
   )
 }
 
-// Exported so consumers can build their own GitOps-flavored filter rails
-// (e.g. OSS's GitOpsGraphFilterRail in the detail view's Topology tab,
-// or hub-web's destination filter sub-bar) without re-implementing the
-// section/facet/toggle primitives. The styles stay in lockstep with the
-// main table's filter sidebar — change once, both surfaces follow.
-export function GitOpsFilterSection({ icon: Icon, title, children }: { icon: ComponentType<{ className?: string }>; title: string; children: ReactNode }) {
-  return (
-    <section className="border-b border-theme-border px-3 py-2">
-      <div className="mb-1.5 flex items-center gap-2">
-        <Icon className="h-3.5 w-3.5 text-theme-text-tertiary" />
-        <span className="text-[10px] font-medium uppercase tracking-wider text-theme-text-tertiary">{title}</span>
-      </div>
-      <div className="space-y-0.5">{children}</div>
-    </section>
-  )
-}
+// GitOps's filter rail is built from the shared faceted-filter primitives
+// (ui/Facet). These aliases keep the existing GitOps* import surface
+// (GitOpsGraphFilterRail imports them from here) while the look + behavior live
+// in one place — change the facet once, every rail follows.
+export const GitOpsFilterSection = FacetSection
+export const GitOpsFacetButton = FacetButton
 
-// Exported alongside GitOpsFilterSection — same reuse motivation. OSS's
-// GitOpsGraphFilterRail (detail view Topology tab) imports it.
-export function GitOpsFacetButton({
-  label,
-  count,
-  active,
-  tone = 'neutral',
-  onClick,
-}: {
-  label: string
-  count: number
-  active: boolean
-  tone?: 'neutral' | 'success' | 'warning' | 'error' | 'info'
-  onClick: () => void
-}) {
-  const dot = {
-    neutral: 'bg-theme-text-tertiary',
-    success: 'bg-emerald-500',
-    warning: 'bg-amber-500',
-    error: 'bg-red-500',
-    info: 'bg-sky-500',
-  }[tone]
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[11px] transition-colors ${
-        active ? 'bg-blue-500/15 text-blue-500' : 'text-theme-text-secondary hover:bg-theme-hover hover:text-theme-text-primary'
-      }`}
-    >
-      <span className={`h-2 w-2 shrink-0 rounded-full ${dot}`} />
-      <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
-      {count > 0 && <span className="tabular-nums text-theme-text-tertiary">{count}</span>}
-    </button>
-  )
-}
-
-// Exported alongside GitOpsFilterSection / GitOpsFacetButton for the same
-// reuse story.
+// A view-mode toggle (table/tiles) — not a facet; stays local.
 export function GitOpsIconToggle({ active, label, icon: Icon, onClick }: { active: boolean; label: string; icon: ComponentType<{ className?: string }>; onClick: () => void }) {
   return (
     <Tooltip content={label}>
@@ -963,6 +964,60 @@ export function GitOpsIconToggle({ active, label, icon: Icon, onClick }: { activ
         <Icon className="h-3.5 w-3.5" />
       </button>
     </Tooltip>
+  )
+}
+
+// Tile mode has no sortable column headers, so it gets this themed sort menu
+// (a native <select> can't be styled to match the rest of the toolbar).
+const SORT_OPTIONS: [SortKey, string][] = [
+  ['urgency', 'Priority'],
+  ['health', 'Health'],
+  ['sync', 'Sync'],
+  ['lastSync', 'Last sync'],
+  ['project', 'Project'],
+  ['name', 'Name'],
+]
+function GitOpsSortMenu({ sortKey, onChange }: { sortKey: SortKey; onChange: (key: SortKey) => void }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) setOpen(false) }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [open])
+  const current = SORT_OPTIONS.find(([k]) => k === sortKey)?.[1] ?? 'Name'
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-label="Sort"
+        className="inline-flex h-8 items-center gap-1.5 rounded-md border border-theme-border bg-theme-base px-2.5 text-xs text-theme-text-secondary hover:bg-theme-hover hover:text-theme-text-primary"
+      >
+        <ArrowDownUp className="h-3.5 w-3.5" />
+        Sort: {current}
+        <ChevronDown className="h-3 w-3 opacity-60" />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-theme-border bg-theme-surface py-1 shadow-xl">
+          {SORT_OPTIONS.map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => { onChange(key); setOpen(false) }}
+              className={clsx(
+                'flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-theme-hover',
+                key === sortKey ? 'font-medium text-theme-text-primary' : 'text-theme-text-secondary',
+              )}
+            >
+              <Check className={clsx('h-3.5 w-3.5 shrink-0', key === sortKey ? 'opacity-100 text-skyhook-500' : 'opacity-0')} />
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -988,8 +1043,17 @@ function LabelsDropdown({
   const filtered = search.trim()
     ? labels.filter((label) => label.name.toLowerCase().includes(search.trim().toLowerCase()))
     : labels
+  const containerRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => {
+      if (!containerRef.current?.contains(e.target as Node)) onOpenChange(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [open, onOpenChange])
   return (
-    <div className="relative">
+    <div ref={containerRef} className="relative">
       <button
         type="button"
         onClick={() => onOpenChange(!open)}
@@ -1076,40 +1140,37 @@ function StatusDistribution({ rows }: { rows: GitOpsRow[] }) {
   // the bar — sync state is visible elsewhere (the OutOfSync summary
   // tile, the Sync column, the filter rail).
   const summary = summarizeGitOpsRows(rows)
-  const total = rows.length || 1
-  const segments = [
-    { key: 'healthy', value: summary.healthy, className: 'bg-emerald-500' },
-    { key: 'progressing', value: summary.progressing, className: 'bg-sky-500' },
-    { key: 'degraded', value: summary.degraded, className: 'bg-red-500' },
-    { key: 'unknown', value: Math.max(0, rows.length - summary.healthy - summary.progressing - summary.degraded), className: 'bg-theme-text-tertiary/40' },
-  ].filter((segment) => segment.value > 0)
   return (
-    <div className="h-2 overflow-hidden rounded-full bg-theme-elevated">
-      <div className="flex h-full w-full">
-        {segments.map((segment) => (
-          <div
-            key={segment.key}
-            className={segment.className}
-            style={{ width: `${Math.max(1, (segment.value / total) * 100)}%` }}
-          />
-        ))}
-      </div>
-    </div>
+    <DistributionBar
+      ariaLabel="Health distribution"
+      segments={[
+        { key: 'degraded', count: summary.degraded, fillClass: 'bg-red-500' },
+        { key: 'progressing', count: summary.progressing, fillClass: 'bg-sky-500' },
+        { key: 'healthy', count: summary.healthy, fillClass: 'bg-emerald-500' },
+        { key: 'unknown', count: Math.max(0, rows.length - summary.healthy - summary.progressing - summary.degraded), fillClass: 'bg-theme-text-tertiary/40' },
+      ]}
+    />
   )
 }
 
 function GitOpsTable({
   rows,
+  sort,
+  onSort,
   onOpen,
   hrefFor,
+  showDestination = true,
   onDestinationClick,
   destinationHrefFor,
   onRowAction,
   pendingRowActions,
 }: {
   rows: GitOpsRow[]
+  sort: { key: SortKey; dir: SortDir }
+  onSort: (key: SortKey) => void
   onOpen: (row: GitOpsRow, event?: ReactMouseEvent) => void
   hrefFor?: (row: GitOpsRow) => string
+  showDestination?: boolean
   onDestinationClick?: (row: GitOpsRow, destination: FleetDestinationStamp) => void
   destinationHrefFor?: (row: GitOpsRow, destination: FleetDestinationStamp) => string
   onRowAction?: (row: GitOpsRow, action: GitOpsRowAction) => void
@@ -1118,19 +1179,19 @@ function GitOpsTable({
   const showActions = !!onRowAction
   return (
     <table className="w-full min-w-[1040px] table-fixed border-separate border-spacing-0 text-sm">
-      <thead className="sticky top-0 z-10 bg-theme-surface">
-        <tr className="text-left text-[11px] uppercase tracking-wide text-theme-text-tertiary">
-          <TableHead className={showActions ? 'w-[16%]' : 'w-[22%]'}>Application</TableHead>
-          <TableHead className="w-[9%]">Project</TableHead>
-          <TableHead className="w-[9%]">Sync</TableHead>
-          <TableHead className="w-[9%]">Health</TableHead>
-          <TableHead className="w-[20%]">Source</TableHead>
-          <TableHead className="w-[14%]">Destination</TableHead>
-          <TableHead className="w-[10%]">Last Sync</TableHead>
+      <thead className="sticky top-0 z-10 bg-theme-base">
+        <tr>
+          <SortableTh label="Application" sortKey="name" activeKey={sort.key} direction={sort.dir} onSort={onSort} className={showActions ? 'w-[16%]' : 'w-[22%]'} />
+          <SortableTh label="Project" sortKey="project" activeKey={sort.key} direction={sort.dir} onSort={onSort} className="w-[9%]" />
+          <SortableTh label="Sync" sortKey="sync" activeKey={sort.key} direction={sort.dir} onSort={onSort} className="w-[9%]" />
+          <SortableTh label="Health" sortKey="health" activeKey={sort.key} direction={sort.dir} onSort={onSort} className="w-[9%]" />
+          <th className={clsx(TH_CLASS, showDestination ? 'w-[20%]' : 'w-[28%]')}>Source</th>
+          {showDestination && <th className={clsx(TH_CLASS, 'w-[14%]')}>Destination</th>}
+          <SortableTh label="Last Sync" sortKey="lastSync" activeKey={sort.key} direction={sort.dir} onSort={onSort} className="w-[10%]" />
           {showActions && (
-            <TableHead className="w-[6%] text-right">
+            <th className={clsx(TH_CLASS, 'w-[6%] text-right')}>
               <span className="sr-only">Actions</span>
-            </TableHead>
+            </th>
           )}
         </tr>
       </thead>
@@ -1199,10 +1260,12 @@ function GitOpsTable({
                 <div className="truncate text-theme-text-primary">{row.repository || row.chart || '-'}</div>
                 <div className="truncate text-xs text-theme-text-tertiary">{[row.targetRevision, row.path || row.chart].filter(Boolean).join(' · ') || '-'}</div>
               </TableCell>
-              <TableCell>
-                <DestinationCell row={row} onDestinationClick={onDestinationClick} destinationHrefFor={destinationHrefFor} />
-                <div className="truncate text-xs text-theme-text-tertiary">{row.destinationNamespace || row.namespace || '-'}</div>
-              </TableCell>
+              {showDestination && (
+                <TableCell>
+                  <DestinationCell row={row} onDestinationClick={onDestinationClick} destinationHrefFor={destinationHrefFor} />
+                  <div className="truncate text-xs text-theme-text-tertiary">{row.destinationNamespace || row.namespace || '-'}</div>
+                </TableCell>
+              )}
               <TableCell>
                 {row.terminating
                   ? <span className="text-orange-400/80">Pending {formatRelativeAge(row.terminationStartedAt ?? '') || 'now'}</span>
@@ -1462,61 +1525,6 @@ function GitOpsTile({
   )
 }
 
-function SummaryTile({
-  label,
-  value,
-  tone = 'neutral',
-  onClick,
-  active = false,
-}: {
-  label: string
-  value: number
-  tone?: SummaryTone
-  onClick?: () => void
-  active?: boolean
-}) {
-  const toneClass = {
-    neutral: 'text-theme-text-primary',
-    warning: 'text-amber-600 dark:text-amber-300',
-    error: 'text-red-600 dark:text-red-300',
-    info: 'text-sky-600 dark:text-sky-300',
-  }[tone]
-  const activeBorderClass = {
-    neutral: 'border-skyhook-500',
-    warning: 'border-amber-500',
-    error: 'border-red-500',
-    info: 'border-sky-500',
-  }[tone]
-  const value$ = <div className={`text-sm font-semibold ${toneClass}`}>{value}</div>
-  const label$ = <div className="text-xs text-theme-text-tertiary">{label}</div>
-  if (!onClick) {
-    return (
-      <div className="rounded-md border border-theme-border bg-theme-base px-3 py-2">
-        {value$}
-        {label$}
-      </div>
-    )
-  }
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
-      className={clsx(
-        'cursor-pointer rounded-md border bg-theme-base px-3 py-2 text-left transition-colors hover:bg-theme-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-skyhook-500',
-        active ? activeBorderClass : 'border-theme-border',
-      )}
-    >
-      {value$}
-      {label$}
-    </button>
-  )
-}
-
-function TableHead({ children, className = '' }: { children: ReactNode; className?: string }) {
-  return <th className={`border-b border-theme-border px-3 py-2 font-medium ${className}`}>{children}</th>
-}
-
 // DestinationCell renders line 1 of the Destination column. Three modes:
 //   - No fleet stamp (single-cluster OSS): show the raw `row.destination`
 //     string from the Argo/Flux spec (typically `https://kubernetes.default.svc`
@@ -1652,23 +1660,39 @@ export function summarizeGitOpsRows(rows: GitOpsRow[]) {
   )
 }
 
+// Natural direction per column, used the first time a column is clicked: the
+// urgency-ordered facets default ascending (most-urgent first); recency defaults
+// to newest-first.
+const SORT_DEFAULT_DIR: Record<SortKey, SortDir> = { urgency: 'asc', name: 'asc', health: 'asc', sync: 'asc', lastSync: 'desc', project: 'asc' }
+
+// Ascending comparator per column (the caller flips it for descending). health
+// ascends worst→best (urgencyRank 0 = broken); lastSync ascends oldest→newest.
 function compareRows(a: GitOpsRow, b: GitOpsRow, sortKey: SortKey) {
-  if (sortKey === 'health') return urgencyRank(a) - urgencyRank(b) || a.name.localeCompare(b.name)
+  if (sortKey === 'urgency') return urgencyRank(a) - urgencyRank(b) || a.name.localeCompare(b.name)
+  if (sortKey === 'health') return healthRank(a) - healthRank(b) || a.name.localeCompare(b.name)
   if (sortKey === 'sync') return syncRank(a.sync) - syncRank(b.sync) || a.name.localeCompare(b.name)
-  if (sortKey === 'lastSync') return (Date.parse(b.lastSync || b.createdAt) || 0) - (Date.parse(a.lastSync || a.createdAt) || 0)
+  if (sortKey === 'lastSync') return (Date.parse(a.lastSync || a.createdAt) || 0) - (Date.parse(b.lastSync || b.createdAt) || 0)
   if (sortKey === 'project') return a.project.localeCompare(b.project) || a.name.localeCompare(b.name)
   return a.name.localeCompare(b.name)
 }
 
-// urgencyRank groups rows by what the operator should do about them.
-// Tiers:
-//   0 — broken (Terminating, Degraded, Missing). Won't self-heal.
-//   1 — OutOfSync, no auto-sync. Drifted, waiting for a human.
-//   2 — OutOfSync with auto-sync. Healing in progress.
-//   3 — Progressing / Reconciling. Mid-rollout.
-//   4 — Unknown. Indeterminate.
-//   5 — Suspended. Intentional non-green.
-//   6 — Synced + Healthy. Calm.
+// Sort the Health column by health STATUS, worst first — so clicking the column
+// groups rows the way its header implies. (This is deliberately NOT the old
+// composite "urgency" rank that also weighed sync / auto-sync: that conflated two
+// dimensions and made the Health column look broken — an OutOfSync-but-Healthy
+// row sorting above a Synced-Progressing one. A sync-aware triage ordering is a
+// reasonable separate default, but not what "sort by Health" should mean.)
+const HEALTH_RANK: Record<string, number> = {
+  Degraded: 0, Missing: 0, Suspended: 1, Unknown: 2, Progressing: 3, Healthy: 4,
+}
+function healthRank(row: GitOpsRow): number {
+  return HEALTH_RANK[row.health] ?? 2
+}
+
+// urgencyRank groups rows by what the operator should do about them — the curated
+// DEFAULT order (sortKey 'urgency'), surfacing broken/drifted apps first.
+//   0 broken (Terminating/Degraded/Missing) · 1 OutOfSync, manual · 2 OutOfSync,
+//   auto · 3 Progressing/Reconciling · 4 Unknown · 5 Suspended · 6 Synced+Healthy.
 function urgencyRank(row: GitOpsRow): number {
   if (row.terminating) return 0
   if (row.health === 'Degraded' || row.health === 'Missing') return 0
