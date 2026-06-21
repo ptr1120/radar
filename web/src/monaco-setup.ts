@@ -6,10 +6,6 @@
 // Called from main.tsx (Radar's binary entry) only — library consumers
 // (e.g. Radar Hub) keep the default CDN loader unless they opt in.
 //
-// This module has no exports, so it MUST be listed in package.json "sideEffects".
-// Without an explicit entry the bundler dead-code-eliminates this whole file from the
-// production build. Keep this file in "sideEffects" if you ever touch it.
-//
 // Import the editor API + YAML grammar directly rather than the `monaco-editor`
 // barrel: the barrel pulls in the JSON/CSS/HTML/TypeScript language services,
 // each of which bundles a heavy web worker (the TS one alone is ~7MB) that Radar
